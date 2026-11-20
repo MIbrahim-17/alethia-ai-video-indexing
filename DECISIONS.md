@@ -46,6 +46,7 @@ These are requirements we can't change. They are listed so that any proposed dec
 | D-011 | Server environment matched to the grading machine | Accepted | 2026-11-20 |
 | D-012 | How the diverse sample was picked, and the resulting subset | Accepted (frozen 2026-11-20) | 2026-11-20 |
 | D-013 | Synthetic fixture suite for unusual and damaged videos | Accepted | 2026-11-20 |
+| D-014 | Every-frame reference builder design | Accepted (3 items pending confirmation) | 2026-11-20 |
 
 ### D-001: Development and benchmark server
 - **Status:** Accepted · **Date:** 2026-11-20
@@ -240,6 +241,60 @@ These are requirements we can't change. They are listed so that any proposed dec
 - **Consequences:**
   - Each fixture needs an expected output that can be derived by hand or independently, not just "whatever the reference produces".
   - Fixtures will be generated in code (PyAV) so they can be reproduced.
+
+### D-014: Every-frame reference builder design
+- **Status:** Accepted, with the items marked ⚠ pending the user's confirmation · **Date:** 2026-11-20 · Carries out D-003.
+- **Code:**
+  - `validation/build_reference.py` stores per-frame detections, one Parquet file plus one JSON file per video, in `work/reference/frames/`.
+  - `validation/reference_aggregate.py` turns them into `reference.jsonl`.
+  - Both are deliberately independent of `run.py`, so a bug isn't shared between the reference and the pipeline it checks.
+- **Model settings:**
+  - `imgsz=640, conf=0.4, iou=0.7` are passed explicitly. Everything else uses the Ultralytics defaults: FP32, class-aware NMS, `max_det=300`, and a letterbox with `auto=True` when every frame in a batch has the same shape (the stride-padded minimum rectangle).
+  - **Finding: in `ultralytics 8.4.215` the default IoU for predict is 0.5 (`PREDICT_IOU`), not the 0.7 the brief calls "the default".** Relying on defaults would therefore be wrong. `run.py` must pass `iou=0.7` too.
+- **Decoding:**
+  - PyAV decodes every frame in presentation order. Frames are converted to BGR with `to_ndarray("bgr24")`.
+  - Rotation comes from the display matrix (`frame.rotation`, counterclockwise degrees) and is applied with `np.rot90(k=rotation // 90)`. ⚠ The direction still has to be checked against the D-013 rotation fixtures.
+- **Timestamps:**
+  - Each frame's time is `t = (pts - first_pts) * time_base`, computed as an exact `Fraction`, and its second is `floor(t)`. There is no floating-point error at second boundaries.
+  - A frame without a timestamp ends the video with an error.
+- **Aggregation (brief §5):**
+  - An object is present when `2 * frames_with_object >= n_frames`.
+  - `people` is the floor of the median of the per-frame person counts.
+  - Lines run from second 0 to the second of the last frame.
+  - On an error, completed second lines are kept and one error line is added.
+- **⚠ Interpretations that need confirmation:**
+  1. **No class filter during inference:** all 80 classes go through NMS, and only the 5 targets are kept afterwards. This is the pure-defaults reading. Because NMS is class-aware, the `classes=` filter only changes results when a frame has more than 300 candidate detections.
+  2. **A second with zero frames** (a timestamp gap) gets `objects: []` and `people: 0`. That's our reading of "a second with nothing found"; the brief's median rule isn't defined for zero frames.
+  3. **PyAV as the reference decoder.** The graders' decoder is unknown, and `cv2.VideoCapture` is the other likely choice. Layer 1 should compare the two.
+- **Run:**
+  - Two GPUs, one worker process each (D-007), batch size 32, decoding in a separate thread.
+  - The run resumes where it left off, using a per-video `.json` file as the done marker.
+  - It refuses to start if any Parquet file's sha256 differs from the frozen manifest.
+- **Smoke test:** 2 videos ran at about 150 fps on one RTX 6000, with the expected number of second lines.
+- **Result 2026-11-20 (reference built and checked):**
+  - **Run:** 101 videos and 767,265 frames in 45.3 minutes on 2 RTX 6000s, about 282 fps in total, with 0 errors.
+  - **Output:** `work/reference/reference.jsonl`, 27,388 second lines (48 MB including the per-frame files). It stays on the server and is not in git.
+  - **`validation/check_reference.py`: 0 failures.** It confirmed that:
+    - all 101 videos are present;
+    - the decoded frame count equals the probe's packet count for every video;
+    - the first frame is at t = 0 and timestamps strictly increase;
+    - every second from 0 to N is present with no gaps or duplicates, and no second has zero frames;
+    - only the exact object names are used.
+  - **Batch versus single-frame check:** 200 random frames from 8 videos were re-run one at a time through stock `predict`. They gave the same target classes, with confidence differences below 0.0005. Batch size 32 with `auto` letterbox gives the same detections as one frame at a time.
+  - **How often each object appears (share of 27,388 seconds):**
+
+    | Object | Share |
+    |---|---|
+    | person | 71.9% |
+    | laptop | 3.6% |
+    | car | 3.1% |
+    | dog | 2.7% |
+    | cell phone | 1.8% |
+
+    `people > 0` in 71.6% of seconds. The person-present/`people = 0` case from a 50% tie occurs in 91 seconds.
+- **Alternatives considered:**
+  - Using the stock `model.predict(source=video)` path. It decodes with cv2, gives no access to exact timestamps, and is harder to make resumable.
+  - Storing only per-second aggregates. That would lose the per-frame data that validation layers 2 and 3 need.
 
 <!--
 Template for new entries (copy below this line):
