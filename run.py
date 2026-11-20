@@ -1,4 +1,4 @@
-"""Video indexing (D-015 baseline, D-017 staged sampling): batched, single process, one GPU.
+"""Video indexing: staged sampling (D-017), TensorRT FP16 (D-025), threaded decoding (D-023), one GPU.
 
     python run.py --input <folder of .parquet files> --output results.jsonl
 
@@ -20,6 +20,11 @@ import sys
 import time
 from fractions import Fraction
 from pathlib import Path
+
+# The timed run is offline (brief §6): Ultralytics must not try the network or install packages.
+# Neither setting changes any computation (D-025).
+os.environ.setdefault("YOLO_OFFLINE", "1")
+os.environ.setdefault("YOLO_AUTOINSTALL", "false")
 
 TARGETS = ["person", "car", "dog", "laptop", "cell phone"]  # brief §1, output order
 PERSON = 0
@@ -184,14 +189,29 @@ def iter_frames(mp4: bytes):
 # ---------------------------------------------------------------- inference
 
 class Detector:
-    def __init__(self, weights: Path, half: bool = False):
+    def __init__(self, weights: Path, half: bool = False, engine: Path | None = None):
         import torch
         from ultralytics import YOLO
 
         self.half = half  # FP16 inference (D-022); main() uses it by default
-
         self.torch = torch
-        self.model = YOLO(str(weights))
+        self.backend = "pytorch"
+        self.model = None
+        if engine is not None:  # TensorRT FP16 engine built by prep.py (D-025)
+            try:
+                import numpy as np
+                self.model = YOLO(str(engine), task="detect")
+                self.model.predict([np.zeros((360, 640, 3), np.uint8)], device=0, **PREDICT_KW)  # loads it
+                self.backend = "tensorrt"
+                p = getattr(self.model, "predictor", None)
+                if p is not None:  # don't keep the warm-up batch (D-019)
+                    p.batch = p.results = p.dataset = None
+            except Exception as e:  # noqa: BLE001 - fall back to PyTorch, and say so
+                print(f"WARNING TensorRT engine {engine} not usable ({type(e).__name__}: {e}); "
+                      f"using PyTorch {'FP16' if half else 'FP32'}", file=sys.stderr)
+                self.model = None
+        if self.model is None:
+            self.model = YOLO(str(weights))
         name_to_id = {v: k for k, v in self.model.names.items()}
         self.target_of = {name_to_id[n]: i for i, n in enumerate(TARGETS)}
         self.device = 0 if torch.cuda.is_available() else "cpu"
@@ -209,7 +229,8 @@ class Detector:
     def _predict(self, imgs):
         """One predict call on same-shape images (D-015 C2)."""
         try:
-            extra = {"quantize": 16} if self.half else {}  # FP32 calls stay exactly as before
+            # FP32 calls stay exactly as before; an engine has its precision built in
+            extra = {"quantize": 16} if self.half and self.backend == "pytorch" else {}
             out = self.model.predict(imgs, device=self.device, **extra, **PREDICT_KW)
         finally:
             self._release_predictor_state()
@@ -889,6 +910,9 @@ def main():
     ap.add_argument("--pipeline", choices=["serial", "threaded"], default="threaded",
                     help="threaded (default, D-023): decode in a separate thread, overlapped with "
                          "inference; serial: the single-threaded fallback")
+    ap.add_argument("--engine", default="auto",
+                    help="TensorRT engine (D-025): 'auto' (default: weights/yolo11l.engine from prep.py if "
+                         "present, else PyTorch FP16), 'off', or a path")
     ap.add_argument("--only-videos", help=argparse.SUPPRESS)  # dev only: subset manifest JSON
     ap.add_argument("--log-inferred", help=argparse.SUPPRESS)  # dev only: frames sent to the model
     a = ap.parse_args()
@@ -902,7 +926,15 @@ def main():
 
     t_start = time.time()
     files = sorted(Path(a.input).glob("*.parquet"))  # D-015 #1
-    det = Detector(Path(a.weights), half=a.precision == "fp16")
+    engine = None
+    if a.engine == "auto":
+        cand = Path(a.weights).with_suffix(".engine")
+        engine = cand if cand.exists() else None
+        if engine is None:
+            print(f"WARNING no TensorRT engine at {cand} (run prep.py); using PyTorch", file=sys.stderr)
+    elif a.engine != "off":
+        engine = Path(a.engine)
+    det = Detector(Path(a.weights), half=a.precision == "fp16", engine=engine)
     w = Writer(a.output)
     keep_partial = not a.drop_partial_second
     pipeline = a.pipeline if SAMPLING[a.sampling] is not None else "serial"  # 'all' is serial only
@@ -913,7 +945,7 @@ def main():
     if INFER_LOG is not None:
         INFER_LOG.close()
     dt = time.time() - t_start
-    print(f"DONE sampling={a.sampling} precision={a.precision} pipeline={pipeline} "
+    print(f"DONE sampling={a.sampling} precision={a.precision} backend={det.backend} pipeline={pipeline} "
           f"peak_queue_mb={STATS['peak_queue_bytes'] / 2**20:.0f} files={len(files)} videos={n_videos} frames={n_frames} "
           f"inferred={det.n_frames} predict_calls={det.n_calls} oom_retries={det.n_oom} "
           f"peak_buffered_frames={STATS['peak_buffered_frames']} "

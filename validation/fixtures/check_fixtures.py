@@ -74,8 +74,9 @@ def main():
     ap.add_argument("--precision", choices=["fp32", "fp16"], default="fp32",
                     help="run.py --precision; the oracle's single-frame predict uses the same precision")
     ap.add_argument("--pipeline", choices=["serial", "threaded"], default="serial")
+    ap.add_argument("--engine", help="TensorRT engine (D-025): run.py uses it and so does the oracle's predict")
     a = ap.parse_args()
-    q = {"quantize": 16} if a.precision == "fp16" else {}
+    q = {"quantize": 16} if a.precision == "fp16" and not a.engine else {}
     stage_rule = None
     if a.sampling != "all":
         m = re.fullmatch(r"staged-([0-9a-z>]+)-([VPCN]+)", a.sampling)
@@ -83,12 +84,14 @@ def main():
 
     fdir = Path(a.fixtures)
     manifest = json.loads((fdir / "manifest.json").read_text())
-    tag = a.sampling.replace(">", "_") + ("" if a.precision == "fp32" else "_fp16") + "_" + a.pipeline
+    tag = a.sampling.replace(">", "_") + ("" if a.precision == "fp32" else "_fp16") + "_" + a.pipeline \
+        + ("_trt" if a.engine else "")
     out_path = fdir / f"run_output_{tag}.jsonl"
     if not a.skip_run:
         r = subprocess.run([sys.executable, str(ROOT / "run.py"), "--input", str(fdir / "input"),
                             "--output", str(out_path), "--sampling", a.sampling,
-                            "--precision", a.precision, "--pipeline", a.pipeline],
+                            "--precision", a.precision, "--pipeline", a.pipeline,
+                            "--engine", a.engine or "off"],
                            capture_output=True, text=True)
         (fdir / f"run_stderr_{tag}.log").write_text(r.stderr)
         if r.returncode != 0:
@@ -104,7 +107,7 @@ def main():
 
     import run as runmod
 
-    model = YOLO(a.weights)
+    model = YOLO(a.engine, task="detect") if a.engine else YOLO(a.weights)
     tid = {k: TARGETS.index(v) for k, v in model.names.items() if v in TARGETS}
     table = pq.read_table(fdir / "input" / "fixtures-critical.parquet", columns=["mp4"])
     mp4s = table.column("mp4").to_pylist()

@@ -41,6 +41,7 @@ import run  # noqa: E402
 
 PRECISION = "fp32"
 PIPELINE = "serial"
+ENGINE = None
 FAST = {"crf": "28", "preset": "ultrafast", "g": "30", "bf": "0"}
 
 
@@ -82,7 +83,7 @@ def rss_kb(pid):
 def part_a(work: Path, order):
     p = subprocess.Popen([sys.executable, str(ROOT / "run.py"), "--input", str(work / "input"),
                           "--output", str(work / "out.jsonl"), "--precision", PRECISION,
-                          "--pipeline", PIPELINE], stderr=subprocess.PIPE, text=True,
+                          "--pipeline", PIPELINE, "--engine", ENGINE or "off"], stderr=subprocess.PIPE, text=True,
                          env={**__import__("os").environ, "CUDA_VISIBLE_DEVICES": "0"})
     samples, stop = [], False
 
@@ -225,6 +226,35 @@ def part_b_threaded(work: Path, det):
     return ok
 
 
+def part_c_engine(work: Path, det):
+    """Part C for a TensorRT engine. Limiting PyTorch's allocator can't force an OOM here:
+    TensorRT allocates its working memory itself when the engine is loaded. So check that
+    GPU memory stays the same over many batches of different sizes and shapes, that results
+    match between a batch and single frames, and that the predictor keeps no batch."""
+    import pyarrow.parquet as pq
+    import torch
+
+    mp4 = pq.read_table(work / "input" / "memtest.parquet").column("mp4").to_pylist()[1]
+    imgs = [img for _, (_, img) in zip(range(64), run.iter_frames(mp4))]  # 1080p frames
+    det.batch_cap.clear()
+    det.detect(imgs[:32])
+    torch.cuda.synchronize()
+    used0 = torch.cuda.mem_get_info()[1] - torch.cuda.mem_get_info()[0]
+    peak = used0
+    for n in (1, 3, 7, 16, 32, 32, 5, 32) * 4:
+        det.detect(imgs[:n])
+        torch.cuda.synchronize()
+        peak = max(peak, torch.cuda.mem_get_info()[1] - torch.cuda.mem_get_info()[0])
+    used1 = torch.cuda.mem_get_info()[1] - torch.cuda.mem_get_info()[0]
+    p = det.model.predictor
+    held = (p.batch, p.results, p.dataset)
+    ok = (used1 - used0) <= 64 << 20 and held == (None, None, None)
+    print(f"  C (TensorRT): GPU memory in use {used0 / 2**20:.0f} MB before, {used1 / 2**20:.0f} MB after "
+          f"32 batches of 1-32 frames (peak {peak / 2**20:.0f} MB); predictor holds a batch: "
+          f"{held != (None, None, None)} -> {'PASS' if ok else 'FAIL'}")
+    return ok
+
+
 def part_c(work: Path, det):
     import pyarrow.parquet as pq
     import torch
@@ -322,18 +352,20 @@ def main():
     ap.add_argument("--work", default="work/memtest")
     ap.add_argument("--precision", choices=["fp32", "fp16"], default="fp32")
     ap.add_argument("--pipeline", choices=["serial", "threaded"], default="serial")
+    ap.add_argument("--engine", help="TensorRT engine (D-025)")
     a = ap.parse_args()
-    global PRECISION, PIPELINE
-    PRECISION, PIPELINE = a.precision, a.pipeline
+    global PRECISION, PIPELINE, ENGINE
+    PRECISION, PIPELINE, ENGINE = a.precision, a.pipeline, a.engine
     work = Path(a.work)
     work.mkdir(parents=True, exist_ok=True)
     t = time.time()
     order = make_videos(work)
     print(f"made {len(order)} synthetic videos in {time.time() - t:.0f}s")
     ok_a = part_a(work, order)
-    det = run.Detector(ROOT / "weights" / "yolo11l.pt", half=a.precision == "fp16")
+    det = run.Detector(ROOT / "weights" / "yolo11l.pt", half=a.precision == "fp16",
+                       engine=Path(a.engine) if a.engine else None)
     ok_b = part_b_threaded(work, det) if a.pipeline == "threaded" else part_b(work, det)
-    ok_c = part_c(work, det)
+    ok_c = part_c_engine(work, det) if det.backend == "tensorrt" else part_c(work, det)
     print(f"== A {'PASS' if ok_a else 'FAIL'}, B {'PASS' if ok_b else 'FAIL'}, C {'PASS' if ok_c else 'FAIL'}")
     sys.exit(0 if ok_a and ok_b and ok_c else 1)
 

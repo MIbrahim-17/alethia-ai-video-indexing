@@ -57,6 +57,7 @@ These are requirements we can't change. They are listed so that any proposed dec
 | D-022 | Experiment 1: FP16 PyTorch inference | **Promoted** (default `--precision fp16`) | 2026-11-20 |
 | D-023 | Experiment 2: overlap decoding with inference | **Promoted** (default `--pipeline threaded`) | 2026-11-20 |
 | D-024 | Experiment 3: PyAV decoder threading | **Rejected at screening** (no end-to-end gain) | 2026-11-21 |
+| D-025 | Experiment 4: TensorRT FP16 | **Promoted** (default `--engine auto`) | 2026-11-21 |
 
 ### D-001: Development and benchmark server
 - **Status:** Accepted · **Date:** 2026-11-20
@@ -719,6 +720,73 @@ These are requirements we can't change. They are listed so that any proposed dec
 - **The isolated decoder throughput** (FRAME about 19,000 fps against SLICE about 3,900, D-021) was not used as evidence, as the user asked.
 - **For the grading machine:** the decoder thread has about 4× headroom. Even if the RTX 4090 runs inference 2× faster, decoding stays hidden. If a later change makes decoding the limit, this experiment can be rerun.
 - **Code:** the option (`--decode-threading`, `--decode-threads`) was removed again to keep `run.py` small. It was about 10 lines: set `stream.codec_context.thread_count` and `stream.thread_type` before decoding.
+### D-025: Experiment 4: TensorRT FP16
+- **Status:** **Promoted**: it meets every D-020 rule. `run.py` now defaults to `--engine auto`. · **Date:** 2026-11-21 · Control: the D-023 default (VPN, PyTorch FP16, threaded decoding).
+- **Why:** in PyTorch FP16 the forward pass is still the largest stage (about 63% in D-022, now with decoding hidden by D-023).
+- **Engine:**
+  - Ultralytics export: `format="engine", quantize=16, dynamic=True, batch=32, imgsz=640`.
+  - TensorRT's optimisation profile is batch 1–32 and input height and width from the minimum up to 1280, with the opt shape 32×3×640×640. It covers every letterbox shape and the OOM halving (D-019).
+  - **The model inputs stay the same:** with a dynamic engine, Ultralytics still uses the `auto` (minimum-rectangle) letterbox, so a 360p frame is still 640×384, as in PyTorch.
+  - The export outputs raw predictions (`nms=False`), and NMS stays Ultralytics's Python NMS with conf 0.4 and IoU 0.7. `bake_argmax` only applies to segmentation.
+- **TensorRT version: 10.16.1.11** (`tensorrt-cu12`, `-bindings`, `-libs`; the wheels come from `pypi.nvidia.com`; the bindings are cp311 manylinux_2_28, which runs on Ubuntu 22.04).
+  - **Rejected: TensorRT 11.5**, which the resolver picks by default. TRT 11 is strongly typed only, so FP16 needs an extra NVIDIA ModelOpt pass that rewrites the ONNX graph. That's one more dependency and one more conversion step that could differ.
+- **Deployment plan (to be verified):**
+  - The engine is tied to the GPU and the TensorRT version, so it's built in the **untimed prep step on the grading machine**.
+  - `run.py` uses `weights/yolo11l.engine` if it exists and loads. Otherwise it falls back to PyTorch FP16 with a warning on stderr.
+  - The offline timed run must not try to reach the network, for example through Ultralytics' requirement checks.
+- **Validation plan (as for FP16, D-022):**
+  - TensorRT every-frame per-frame detections on dev and holdout (`build_reference.py` with the engine).
+  - Layer-2 comparison against FP32.
+  - Simulator prediction, then real runs, with every difference in frames run explained.
+  - The D-020 targets on dev and holdout.
+  - Fixtures, unit tests and the memory test.
+  - Screening, then interleaved timing against the control.
+- **Results (2026-11-21):**
+  - **Engine build (`prep.py`):** 350 s on the Quadro RTX 6000; 51 MB.
+    - The first attempt stopped: Ultralytics' AutoUpdate began installing an unpinned `onnxruntime-gpu` into the environment, needed only for the optional ONNX simplify pass. It was killed before anything was installed.
+    - Fix: export with `simplify=False` (TensorRT optimises the graph itself), and `prep.py` sets `YOLO_AUTOINSTALL=false`, so a missing package fails loudly.
+    - `run.py` also sets `YOLO_OFFLINE=1` and `YOLO_AUTOINSTALL=false`. They change no computation.
+  - **Install cost:** `tensorrt-cu12-libs` is a **4.0 GB** download, at about 2 MB/s from `pypi.nvidia.com` here (37 min). This goes in the grader's untimed prep step.
+  - **Screening** (profiling set, GPU 0 alone): control 193.1 / 193.7 s; **TensorRT 103.1 / 103.1 s (−46.7%)**.
+  - **Layer 2** (TensorRT every-frame runs against FP32):
+
+    | Set | Object set differs | Person count differs | Mean / p99 confidence difference | Unmatched FP32 boxes |
+    |---|---|---|---|---|
+    | dev | 944 frames (0.123%) | 0.292% | 0.0013 / 0.0092 | 1,860, of which 1,850 had confidence 0.40–0.45 |
+    | holdout | 354 frames (0.088%) | 0.273% | 0.0012 / 0.0084 | 856, of which 845 had confidence 0.40–0.45 |
+
+    - About twice PyTorch FP16's rate, and again at the threshold.
+    - **Batched versus single-frame: confidence difference 0.0000, 0 mismatches.** TensorRT doesn't depend on batch composition, unlike PyTorch FP16 (0.007).
+  - **End-to-end correctness** (real runs, `score.py` against the FP32 references):
+
+    | Set | F1 gate (micro / macro) | Lowest class | People exact | Within ±1 | Complete |
+    |---|---|---|---|---|---|
+    | dev (101) | **0.9928** (0.9973 / 0.9928) | cell phone 0.9834 | **0.9922** | **0.9998** | yes, 0 errors |
+    | holdout (48) | **0.9933** (0.9976 / 0.9933) | cell phone 0.9812 | **0.9934** | **0.9999** | yes |
+    | PyTorch FP16, for comparison | 0.9938 / 0.9947 | | 0.9928 / 0.9939 | 0.9999 | |
+
+    - Above the D-020 targets. The F1 margin over 0.99 is the smallest so far (0.0028 on dev).
+  - **Completeness:** the real runs equal the simulator's prediction on **both** sets: 0 differing seconds, and the same frame counts for all 101 + 48 videos (191,162 and 95,621). Because TensorRT is batch-invariant, there's no difference left to explain.
+  - **Speed** (66-video timing set, interleaved, GPU 0 alone):
+    - controls (D-023) 534.6 / 534.9 s, both byte-identical to S-6;
+    - **TensorRT 310.2 / 310.1 s, −42.0% (1.72× faster)**, the two runs byte-identical.
+    - Diverse 161.0 s, holdout 243.9 s. Logged as S-10.
+  - **Robustness:**
+    - 17 of 17 fixtures pass through the TensorRT + threaded path (the oracle's single-frame predict uses the engine), and 23 of 23 unit tests pass.
+    - **Fallback:** a corrupt engine and a missing engine each give a warning on stderr, `backend=pytorch`, and output byte-identical to the PyTorch FP16 fixture run.
+  - **Memory:** `test_memory.py --engine` passes.
+    - A: RSS levels off at about 4.4–4.5 GB.
+    - B: threaded release works.
+    - C (TensorRT): GPU memory in use stays at 5,842 MB over 32 batches of 1–32 frames, and the predictor keeps no batch.
+    - TensorRT reserves 4.6 GB of VRAM up front, sized for its largest profile shape. Peak RSS on the timing set is 6.2 GB, lower than PyTorch FP16's 7.9 GB.
+    - The OOM-halving path stays as it is but is effectively unused, because TensorRT's memory is fixed when the engine loads.
+  - **Offline:** `validation/offline_guard.py` (Python DNS and socket calls refused and logged) on the profiling set: **0 network attempts**, and the output is byte-identical to the screening run.
+- **Consequences for deployment:**
+  - `requirements.txt` must pin `tensorrt-cu12`, `tensorrt-cu12-bindings` and `tensorrt-cu12-libs` 10.16.1.11, with `--extra-index-url https://pypi.nvidia.com`, plus `onnx` (needed by the export).
+  - The README's prep command must run `python prep.py` on the grading machine (about 6 min, plus the 4 GB download).
+  - The engine isn't committed (`*.engine` and `weights/` are ignored).
+  - If prep wasn't run, the run still works, on PyTorch FP16.
+  - The engine built here is for the RTX 6000 (Turing). The grader's RTX 4090 needs its own build, which `prep.py` does.
 ---
 
 ## Speed log
@@ -736,6 +804,8 @@ Every timed run, in order, so each optimisation can be compared with the one bef
 | S-6 | 2026-11-20 | VPN + **FP16** (D-022) | sequential subset, 2 runs | 0 (RTX 6000), alone | 66 / 526,328 / 5.21 h | **658.3 s / 658.4 s (11.0 min)** | 799.5 | 0.0351 | ≈4.4 h | ≈0.46 h (27 min) | dev: F1 0.9938, exact 0.9928, within ±1 0.9999; holdout: 0.9947 / 0.9939 / 0.9999 | 126,169 frames run, 4,495 predict calls, 0 OOM retries, peak RSS 7.18 GB. The two runs are byte-for-byte identical. **1.60× faster than S-3/S-5; 5.8× faster than S-1.** Diverse: 360.8 s; holdout: 526.0 s (0.0367 s per video-s). |
 | S-7 | 2026-11-20 | VPN + FP16 + **threaded decoding** (D-023) | sequential subset, 2 runs interleaved with 2 serial controls (657.5 / 659.2 s) | 0 (RTX 6000), alone | 66 / 526,328 / 5.21 h | **533.8 s / 534.2 s (8.9 min)** | 985.6 | 0.0285 | ≈3.6 h | ≈0.37 h (22 min) | byte-identical to S-6 on dev and holdout; same inferred frame IDs | −18.9% against the serial controls. CPU 134%, peak RSS 7.9–8.1 GB, queue peak 512 MB. Diverse 299.0 s, holdout 427.6 s. **7.2× faster than S-1.** |
 | S-8 | 2026-11-21 | D-023 + decoder threading FRAME/AUTO (D-024) | profiling set (10 videos), screening only | 0 (RTX 6000), alone | 10 / 116,255 / — | 191.9–193.8 s across 5 configurations; controls 192.9 / 194.2 s | — | — | — | — | byte-identical; same inferred frames | **No gain (within ±0.6%). Rejected, not promoted.** |
+| S-9 | 2026-11-21 | D-023 + TensorRT FP16 (D-025) | profiling set (10 videos), screening | 0 (RTX 6000), alone | 10 / 116,255 / — | 103.1 s / 103.1 s; controls 193.1 / 193.7 s | — | — | — | — | 22 of 4,107 seconds differ from PyTorch FP16 (numerical) | −46.7%. Promising, so full runs followed (S-10). |
+| S-10 | 2026-11-21 | VPN + **TensorRT FP16** + threaded (D-025) | sequential subset, 2 runs interleaved with 2 D-023 controls (534.6 / 534.9 s) | 0 (RTX 6000), alone | 66 / 526,328 / 5.21 h | **310.2 s / 310.1 s (5.2 min)** | 1,696.7 | 0.0165 | ≈2.1 h | ≈0.21 h (13 min) | dev F1 0.9928, exact 0.9922, within ±1 0.9998; holdout 0.9933 / 0.9934 / 0.9999; equal to the simulator on both | −42.0% against the controls. 125,922 frames run, 4,489 predict calls, CPU 156%, peak RSS 6.23 GB. The two runs are byte-identical. Diverse 161.0 s, holdout 243.9 s. **12.4× faster than S-1.** |
 
 <!--
 Template for new entries (copy below this line):
