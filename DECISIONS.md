@@ -52,8 +52,9 @@ These are requirements we can't change. They are listed so that any proposed dec
 | D-017 | Staged sampling `staged-1>3>all-VPN` in `run.py` | Accepted, **final** (approved by the user 2026-11-20) | 2026-11-20 |
 | D-018 | Untouched correctness holdout | Accepted | 2026-11-20 |
 | D-019 | Memory bounds and CUDA OOM recovery | Accepted | 2026-11-20 |
-| D-020 | Optimisation plan, acceptance rules and stopping rule | Accepted (speed threshold pending confirmation) | 2026-11-20 |
+| D-020 | Optimisation plan, acceptance rules and stopping rule | Accepted (5% speed threshold pending confirmation) | 2026-11-20 |
 | D-021 | Step 0: profile of the VPN FP32 pipeline | Accepted (measurement) | 2026-11-20 |
+| D-022 | Experiment 1: FP16 PyTorch inference | **Promoted** (default `--precision fp16`) | 2026-11-20 |
 
 ### D-001: Development and benchmark server
 - **Status:** Accepted · **Date:** 2026-11-20
@@ -592,6 +593,50 @@ These are requirements we can't change. They are listed so that any proposed dec
   4. **Decoder threading (#3):** decoding gets about 4.9× faster in isolation. That would save about 25 s of 338 s (about 7%), more once inference is faster.
   5. **Batch size (#5):** 32 → 64 gains under 1% in FP32. Low priority.
   6. **cuDNN benchmark** is off by default (`torch.backends.cudnn.benchmark = False`). It belongs to #7.
+### D-022: Experiment 1: FP16 PyTorch inference
+- **Status:** **Promoted**: it meets every D-020 rule. `run.py` now defaults to `--precision fp16`, and `--precision fp32` is the fallback. · **Date:** 2026-11-20
+- **Change:** `model.predict(..., quantize=16)`, the current form of Ultralytics's deprecated `half=True`. FP32 calls pass no new argument, so the fallback is unchanged. Sampling stays VPN (D-017).
+- **Screening (D-021 profiling set):** 338.4 s → 222.4 s (−34%). The forward pass went from 256 s to 139 s (1.84× faster), and GPU use fell from 78% to 52%, so CPU stages are now 37% of the time.
+- **Layer 2, frame by frame** (`validation/compare_precision.py`; FP16 every-frame runs built with `build_reference.py --quantize 16`, compared with the FP32 reference):
+
+  | Set | Frames | Object set differs | Person count differs | Mean / p99 confidence difference of matched boxes | Unmatched FP32 boxes |
+  |---|---|---|---|---|---|
+  | dev (101) | 767,265 | 540 (0.070%) | 1,355 (0.177%) | 0.0007 / 0.0058 | 1,116, of which 1,106 had confidence 0.40–0.45 |
+  | holdout (48) | 403,553 | 215 (0.053%) | 645 (0.160%) | 0.0006 / 0.0050 | 573, of which 563 had confidence 0.40–0.45 |
+
+  - The differences are detections close to the 0.4 threshold.
+  - FP16 batched versus single-frame: 0 class-set mismatches on 200 + 200 frames, but the confidence difference reaches **0.007**, against under 0.0005 in FP32.
+- **End-to-end correctness** (real FP16 VPN runs, scored with `score.py` against the FP32 every-frame references):
+
+  | Set | F1 gate (micro / macro) | Lowest class | People exact | Within ±1 | Complete |
+  |---|---|---|---|---|---|
+  | dev (101) | **0.9938** (0.9976 / 0.9938) | cell phone 0.9844 | **0.9928** | **0.9999** | yes, 0 missing, extra or duplicate lines, 0 errors |
+  | holdout (48) | **0.9947** (0.9979 / 0.9947) | cell phone 0.9847 | **0.9939** | **0.9999** | yes |
+  | FP32 VPN, for comparison | dev 0.9947, holdout 0.9947 | | dev 0.9940, holdout 0.9950 | 0.9999 | |
+
+  - All values are above the D-020 targets (F1 ≥ 0.99, exact ≥ 0.98, within ±1 ≥ 0.995). The cost against FP32 is at most 0.0012 on any metric.
+  - For reference, FP16 on every frame (no sampling) scores dev F1 0.9989 and exact 0.9985, and holdout 1.0000 and 0.9989.
+- **Completeness: frame differences explained.**
+  - The simulator, run on the FP16 every-frame detections, predicts the real run exactly on the **holdout** (0 seconds differ, frame counts equal for all 48 videos).
+  - On **dev**, 4 of 101 videos differ (191,862 frames run against 191,873 predicted), and 1 of 27,388 seconds. `validation/explain_frame_diffs.py` shows **exactly one frame per video** whose detections differ between the two batchings.
+    - Three are confidences within 0.002 of 0.4: person 0.4006 present or not, and laptop 0.4016.
+    - One is a car/truck near-tie: `00000:28` frame 4265 is car 0.525 in the build batch and truck 0.83 in `run.py`'s batch.
+    - In 2 of the 4, `run.py` agrees with FP32 and the stored FP16 run doesn't.
+    - Each flip changes one second's escalation, which accounts for every frame-count difference and the one differing second.
+  - **Cause:** FP16 results depend slightly on batch composition. The FP16 simulation is therefore a close prediction, not an exact one.
+  - **Determinism:** two runs with the same batching are byte-for-byte identical.
+- **Speed** (66-video timing set, GPU 0 alone, 2 runs): **658.3 s and 658.4 s**, against FP32's 1,049.2 s and 1,053.7 s. That's **−37.4% wall time (1.60× faster)**, far above the 5% threshold, with run-to-run noise under 0.1%. Logged as S-6.
+- **Robustness and memory:** 17 of 17 fixtures pass with `--precision fp16` (oracle with single-frame FP16 predict), 21 of 21 unit tests pass, and `test_memory.py --precision fp16` passes A, B and C.
+  - A: buffer peak 1,068 MB, RSS levels off at about 4.1 GB.
+  - C: every OOM retry starts at exactly the 80 MB base; the old handler, for comparison, still leaks and fails.
+- **Deployment:** no new files or downloads. FP16 runs on the same `yolo11l.pt` and needs no prep step, so it works offline. The RTX 4090 (Ada) has FP16 tensor cores.
+  - **Risk:** near-threshold flips will differ on the grader's GPU. FP32 has the same exposure, and the measured accuracy cost of FP16 is small.
+- **Alternatives considered:**
+  - Staying on FP32: 1.6× slower for at most 0.0012 better on any metric.
+  - Rebuilding the FP16 per-frame runs with `run.py`'s exact batching so the simulation matches exactly: no accuracy information gained, because the flips are explained above.
+- **Consequences:**
+  - Peak RSS rose from 5.4 to 7.2 GB, from CUDA/cuBLAS FP16 workspaces; it's bounded and well inside 64 GB.
+  - The CPU stages (decode 14%, convert 12%, pre/post-processing 9%) are now the next bottleneck, so overlapping (#2) and decoder threading (#3) gain in value.
 ---
 
 ## Speed log
@@ -606,6 +651,7 @@ Every timed run, in order, so each optimisation can be compared with the one bef
 | S-3b | 2026-11-20 | Same as S-3 | diverse subset (10 files) | 0 (RTX 6000) | 35 / 240,937 / 2.38 h | 541 s (9.0 min) | 445.1 | 0.0632 | — | — | (pooled with S-3 above) | 65,647 frames run (27.2%), 2,335 predict calls, peak RSS 5.51 GB. The holdout download (network only) overlapped this run, so it's for information only. |
 | S-4 | 2026-11-20 | `staged-1>3>all-VPN` (D-017) | holdout (D-018) | 0 (RTX 6000), alone | 48 / 403,553 / 3.98 h | 827 s (13.8 min) | 487.7 | 0.0577 | ≈7.2 h | ≈0.75 h | holdout: F1 gate 0.9947, exact 0.9950, within ±1 0.9999 | 96,149 frames run (23.8%), 3,445 predict calls, peak RSS 5.58 GB. Agrees with S-3 (0.0559 s per video-s). |
 | S-5 | 2026-11-20 | `staged-1>3>all-VPN` with the D-019 memory changes | sequential subset | 0 (RTX 6000), alone | 66 / 526,328 / 5.21 h | 1,054 s (17.6 min) | 499.5 | 0.0562 | ≈7.0 h | ≈0.73 h | output **byte-for-byte identical to S-3** on all 101 videos; equal to the simulator | Same as S-3 within 0.4%. 126,201 frames run, 4,494 predict calls, 0 OOM retries, peak buffer 990 frames / 326 MB (diverse part: 500 MB), 0 overflow seconds, peak RSS 5.42 GB. |
+| S-6 | 2026-11-20 | VPN + **FP16** (D-022) | sequential subset, 2 runs | 0 (RTX 6000), alone | 66 / 526,328 / 5.21 h | **658.3 s / 658.4 s (11.0 min)** | 799.5 | 0.0351 | ≈4.4 h | ≈0.46 h (27 min) | dev: F1 0.9938, exact 0.9928, within ±1 0.9999; holdout: 0.9947 / 0.9939 / 0.9999 | 126,169 frames run, 4,495 predict calls, 0 OOM retries, peak RSS 7.18 GB. The two runs are byte-for-byte identical. **1.60× faster than S-3/S-5; 5.8× faster than S-1.** Diverse: 360.8 s; holdout: 526.0 s (0.0367 s per video-s). |
 
 <!--
 Template for new entries (copy below this line):

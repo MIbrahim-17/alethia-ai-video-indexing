@@ -180,10 +180,12 @@ def model_only(det, batches=(1, 4, 8, 16, 32, 64), iters=20):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="work/profile/p0.json")
+    ap.add_argument("--precision", choices=["fp32", "fp16"], default="fp32")
+    ap.add_argument("--skip-isolated", action="store_true")
     a = ap.parse_args()
     videos = make_profile_set()
     mp4s, t_read = load_mp4s(videos)
-    det = run.Detector(ROOT / "weights" / "yolo11l.pt")
+    det = run.Detector(ROOT / "weights" / "yolo11l.pt", half=a.precision == "fp16")
     det.detect([__import__("numpy").zeros((360, 640, 3), "uint8")])  # warm-up, not timed
 
     wall, T, C, util = profile_pipeline(mp4s, det)
@@ -198,7 +200,11 @@ def main():
     for name, t in rows:
         print(f"  {name:40s} {t:8.1f} s  {t / wall:6.1%}")
 
-    dec = {}
+    dec, mo = {}, {}
+    if a.skip_isolated:
+        Path(a.out).parent.mkdir(parents=True, exist_ok=True)
+        Path(a.out).write_text(json.dumps({"wall": wall, "stages": T, "counts": C, "gpu_util": util}, indent=1))
+        return
     for tt in (None, "FRAME", "AUTO"):
         n, t = decode_only(mp4s, tt)
         dec[tt or "default(SLICE)"] = round(n / t, 1)

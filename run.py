@@ -184,9 +184,11 @@ def iter_frames(mp4: bytes):
 # ---------------------------------------------------------------- inference
 
 class Detector:
-    def __init__(self, weights: Path):
+    def __init__(self, weights: Path, half: bool = False):
         import torch
         from ultralytics import YOLO
+
+        self.half = half  # FP16 inference (D-022); main() uses it by default
 
         self.torch = torch
         self.model = YOLO(str(weights))
@@ -207,7 +209,8 @@ class Detector:
     def _predict(self, imgs):
         """One predict call on same-shape images (D-015 C2)."""
         try:
-            out = self.model.predict(imgs, device=self.device, **PREDICT_KW)
+            extra = {"quantize": 16} if self.half else {}  # FP32 calls stay exactly as before
+            out = self.model.predict(imgs, device=self.device, **extra, **PREDICT_KW)
         finally:
             self._release_predictor_state()
         self.n_calls += 1
@@ -584,6 +587,8 @@ def main():
                     help="after a failure partway through, drop the unfinished second (D-015 #3)")
     ap.add_argument("--sampling", choices=list(SAMPLING), default=DEFAULT_SAMPLING,
                     help="which frames go through the model (D-017); 'all' is the every-frame fallback")
+    ap.add_argument("--precision", choices=["fp32", "fp16"], default="fp16",
+                    help="model precision; fp16 was promoted in D-022, fp32 is the fallback")
     ap.add_argument("--only-videos", help=argparse.SUPPRESS)  # dev only: subset manifest JSON
     a = ap.parse_args()
 
@@ -593,7 +598,7 @@ def main():
 
     t_start = time.time()
     files = sorted(Path(a.input).glob("*.parquet"))  # D-015 #1
-    det = Detector(Path(a.weights))
+    det = Detector(Path(a.weights), half=a.precision == "fp16")
     w = Writer(a.output)
     keep_partial = not a.drop_partial_second
     n_videos = n_frames = 0
@@ -639,7 +644,7 @@ def main():
 
     w.close()
     dt = time.time() - t_start
-    print(f"DONE sampling={a.sampling} files={len(files)} videos={n_videos} frames={n_frames} "
+    print(f"DONE sampling={a.sampling} precision={a.precision} files={len(files)} videos={n_videos} frames={n_frames} "
           f"inferred={det.n_frames} predict_calls={det.n_calls} oom_retries={det.n_oom} "
           f"peak_buffered_frames={STATS['peak_buffered_frames']} "
           f"peak_buffered_mb={STATS['peak_buffered_bytes'] / 2**20:.0f} "

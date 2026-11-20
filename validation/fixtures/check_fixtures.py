@@ -71,7 +71,10 @@ def main():
     ap.add_argument("--weights", default=str(ROOT / "weights" / "yolo11l.pt"))
     ap.add_argument("--sampling", default="all", help="run.py --sampling; the oracle applies the "
                     "simulator's selection rule (validation/simulate_sampling.py) for staged strategies")
+    ap.add_argument("--precision", choices=["fp32", "fp16"], default="fp32",
+                    help="run.py --precision; the oracle's single-frame predict uses the same precision")
     a = ap.parse_args()
+    q = {"quantize": 16} if a.precision == "fp16" else {}
     stage_rule = None
     if a.sampling != "all":
         m = re.fullmatch(r"staged-([0-9a-z>]+)-([VPCN]+)", a.sampling)
@@ -79,12 +82,14 @@ def main():
 
     fdir = Path(a.fixtures)
     manifest = json.loads((fdir / "manifest.json").read_text())
-    out_path = fdir / f"run_output_{a.sampling.replace('>', '_')}.jsonl"
+    tag = a.sampling.replace(">", "_") + ("" if a.precision == "fp32" else "_fp16")
+    out_path = fdir / f"run_output_{tag}.jsonl"
     if not a.skip_run:
         r = subprocess.run([sys.executable, str(ROOT / "run.py"), "--input", str(fdir / "input"),
-                            "--output", str(out_path), "--sampling", a.sampling],
+                            "--output", str(out_path), "--sampling", a.sampling,
+                            "--precision", a.precision],
                            capture_output=True, text=True)
-        (fdir / f"run_stderr_{a.sampling.replace('>', '_')}.log").write_text(r.stderr)
+        (fdir / f"run_stderr_{tag}.log").write_text(r.stderr)
         if r.returncode != 0:
             print(r.stderr[-3000:])
             raise SystemExit(f"run.py exited {r.returncode}")
@@ -139,7 +144,7 @@ def main():
                 secs = [math.floor(t - t0) for t in intended]
                 dets = []
                 for img in frames:
-                    r = model.predict(img, imgsz=640, conf=0.4, iou=0.7, verbose=False)[0]
+                    r = model.predict(img, imgsz=640, conf=0.4, iou=0.7, verbose=False, **q)[0]
                     dets.append([tid[int(c)] for c in r.boxes.cls.tolist() if int(c) in tid])
                 if stage_rule is not None:  # keep only the frames the staged rule picks
                     keep = select_staged(secs, dets, *stage_rule)

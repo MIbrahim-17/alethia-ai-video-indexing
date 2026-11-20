@@ -45,6 +45,7 @@ def main():
     ap.add_argument("--recheck-frames", type=int, default=0)
     ap.add_argument("--recheck-videos", type=int, default=4)
     ap.add_argument("--weights", default="weights/yolo11l.pt")
+    ap.add_argument("--quantize", type=int, choices=[16], help="recheck FP16 per-frame runs (D-022)")
     ap.add_argument("--check-timebase", action="store_true",
                     help="decode every frame and check frame.time_base == stream.time_base (D-015 C4)")
     ap.add_argument("--workers", type=int, default=16)
@@ -199,7 +200,8 @@ def recheck_batch_equivalence(subset, fdir, a) -> list[str]:
                 rot = int(f.rotation or 0)
                 if rot % 360:
                     img = np.ascontiguousarray(np.rot90(img, k=(rot // 90) % 4))
-                res = model.predict(img, imgsz=640, conf=0.4, iou=0.7, verbose=False)[0]
+                res = model.predict(img, imgsz=640, conf=0.4, iou=0.7, verbose=False,
+                                    **({"quantize": a.quantize} if a.quantize else {}))[0]
                 cls = res.boxes.cls.cpu().numpy().astype(int)
                 conf = res.boxes.conf.cpu().numpy()
                 got = sorted((tid[c], round(float(s), 3)) for c, s in zip(cls, conf) if c in tid)

@@ -106,7 +106,7 @@ def decode_frames(mp4: bytes, out_q, info: dict):
 
 # ---------------------------------------------------------------- GPU worker
 
-def gpu_worker(gpu: str, task_q, done_q, out_dir: str, weights: str, batch: int):
+def gpu_worker(gpu: str, task_q, done_q, out_dir: str, weights: str, batch: int, quantize=None):
     os.environ["CUDA_VISIBLE_DEVICES"] = gpu  # set before torch is imported
     import numpy as np
     import pyarrow as pa
@@ -142,7 +142,8 @@ def gpu_worker(gpu: str, task_q, done_q, out_dir: str, weights: str, batch: int)
                 nonlocal idx
                 if not buf_img:
                     return
-                results = model.predict(buf_img, device=0, **PREDICT_KW)
+                extra = {"quantize": quantize} if quantize else {}  # D-022: FP16 per-frame runs only
+                results = model.predict(buf_img, device=0, **extra, **PREDICT_KW)
                 for p, r in zip(buf_pts, results):
                     b = r.boxes
                     cls = b.cls.cpu().numpy().astype(int)
@@ -216,6 +217,8 @@ def main():
     ap.add_argument("--gpus", default="0,1")
     ap.add_argument("--weights", default="weights/yolo11l.pt")
     ap.add_argument("--batch", type=int, default=32)
+    ap.add_argument("--quantize", type=int, choices=[16], help="FP16 per-frame detections (D-022); "
+                    "the every-frame grading reference itself is always FP32")
     ap.add_argument("--limit", type=int, default=0, help="only the first N videos (smoke test)")
     a = ap.parse_args()
 
@@ -235,7 +238,7 @@ def main():
     ctx = mp.get_context("spawn")
     task_q, done_q = ctx.Queue(maxsize=4), ctx.Queue()
     gpus = a.gpus.split(",")
-    procs = [ctx.Process(target=gpu_worker, args=(g, task_q, done_q, a.out, a.weights, a.batch))
+    procs = [ctx.Process(target=gpu_worker, args=(g, task_q, done_q, a.out, a.weights, a.batch, a.quantize))
              for g in gpus]
     for p in procs:
         p.start()

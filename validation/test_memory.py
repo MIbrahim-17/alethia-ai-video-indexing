@@ -39,6 +39,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "validation" / "fixtures"))
 import run  # noqa: E402
 
+PRECISION = "fp32"
 FAST = {"crf": "28", "preset": "ultrafast", "g": "30", "bf": "0"}
 
 
@@ -79,7 +80,7 @@ def rss_kb(pid):
 
 def part_a(work: Path, order):
     p = subprocess.Popen([sys.executable, str(ROOT / "run.py"), "--input", str(work / "input"),
-                          "--output", str(work / "out.jsonl")], stderr=subprocess.PIPE, text=True,
+                          "--output", str(work / "out.jsonl"), "--precision", PRECISION], stderr=subprocess.PIPE, text=True,
                          env={**__import__("os").environ, "CUDA_VISIBLE_DEVICES": "0"})
     samples, stop = [], False
 
@@ -229,7 +230,8 @@ def part_c(work: Path, det):
     def old_detect(batch):
         old_entries.append((len(batch), torch.cuda.memory_allocated()))
         try:
-            return det.model.predict(batch, device=0, **run.PREDICT_KW)
+            return det.model.predict(batch, device=0, **run.PREDICT_KW,
+                                     **({"quantize": 16} if det.half else {}))
         except torch.cuda.OutOfMemoryError:
             torch.cuda.empty_cache()
             if len(batch) == 1:
@@ -270,14 +272,17 @@ def part_c(work: Path, det):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--work", default="work/memtest")
+    ap.add_argument("--precision", choices=["fp32", "fp16"], default="fp32")
     a = ap.parse_args()
+    global PRECISION
+    PRECISION = a.precision
     work = Path(a.work)
     work.mkdir(parents=True, exist_ok=True)
     t = time.time()
     order = make_videos(work)
     print(f"made {len(order)} synthetic videos in {time.time() - t:.0f}s")
     ok_a = part_a(work, order)
-    det = run.Detector(ROOT / "weights" / "yolo11l.pt")
+    det = run.Detector(ROOT / "weights" / "yolo11l.pt", half=a.precision == "fp16")
     ok_b = part_b(work, det)
     ok_c = part_c(work, det)
     print(f"== A {'PASS' if ok_a else 'FAIL'}, B {'PASS' if ok_b else 'FAIL'}, C {'PASS' if ok_c else 'FAIL'}")
