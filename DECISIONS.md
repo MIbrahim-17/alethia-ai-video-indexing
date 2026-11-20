@@ -56,6 +56,7 @@ These are requirements we can't change. They are listed so that any proposed dec
 | D-021 | Step 0: profile of the VPN FP32 pipeline | Accepted (measurement) | 2026-11-20 |
 | D-022 | Experiment 1: FP16 PyTorch inference | **Promoted** (default `--precision fp16`) | 2026-11-20 |
 | D-023 | Experiment 2: overlap decoding with inference | **Promoted** (default `--pipeline threaded`) | 2026-11-20 |
+| D-024 | Experiment 3: PyAV decoder threading | **Rejected at screening** (no end-to-end gain) | 2026-11-21 |
 
 ### D-001: Development and benchmark server
 - **Status:** Accepted · **Date:** 2026-11-20
@@ -698,6 +699,26 @@ These are requirements we can't change. They are listed so that any proposed dec
   - Converting frames to BGR in the decoder thread: frame selection depends on the model's results, so it can't be known in advance, except for the stage-1 middle frames, which are about 14% of the frames run.
   - A decoder process instead of a thread: PyAV releases the GIL while decoding, so a thread is enough and avoids copying frames between processes.
 - **What's left on the CPU** (from D-021/D-022): converting YUV to BGR (about 12%) and pre/post-processing (about 9%) still run in the main thread between GPU batches.
+### D-024: Experiment 3: PyAV decoder threading
+- **Status:** **Rejected at screening.** No configuration was promising, so no interleaved full runs were made (the user's instruction). The current version (D-023) stays. · **Date:** 2026-11-21
+- **Tested:** `stream.thread_type` FRAME with `thread_count` 0 (FFmpeg decides), 2, 4 and 8, and AUTO with 0, set in `iter_raw_frames` (inside the D-023 decoder thread). Everything else is the D-023 default (VPN, FP16, threaded).
+- **Screening:** the 10-video profiling set, GPU 0 alone, with a control (PyAV default SLICE) at the start and the end:
+
+  | Run | Wall time | CPU | Peak RSS | Output vs control | Frames sent to the model vs control |
+  |---|---|---|---|---|---|
+  | control (SLICE) | 192.9 s | 128% | 7.63 GB | — | — |
+  | FRAME, 0 | 193.7 s | 136% | 7.72 GB | byte-identical | identical |
+  | FRAME, 2 | 193.1 s | 130% | 7.66 GB | byte-identical | identical |
+  | FRAME, 4 | 191.9 s | 131% | 7.66 GB | byte-identical | identical |
+  | AUTO, 0 | 193.8 s | 136% | 7.69 GB | byte-identical | identical |
+  | FRAME, 8 | 193.1 s | 134% | 7.67 GB | byte-identical | identical |
+  | control 2 (SLICE) | 194.2 s | 128% | 7.64 GB | byte-identical | identical |
+
+  - Every configuration is within ±0.6% of the mean of the two controls (193.6 s), the same as the run-to-run noise, and far from the 5% threshold.
+- **Why there's no gain:** since D-023, decoding runs in its own thread and is already hidden. The single-threaded decoder manages about 3,900 frames/s on its own (D-021), against about 985 frames/s that the pipeline uses (S-7). The limit is the main thread: GPU inference, the YUV → BGR conversion and pre/post-processing. Faster decoding only fills the queue sooner.
+- **The isolated decoder throughput** (FRAME about 19,000 fps against SLICE about 3,900, D-021) was not used as evidence, as the user asked.
+- **For the grading machine:** the decoder thread has about 4× headroom. Even if the RTX 4090 runs inference 2× faster, decoding stays hidden. If a later change makes decoding the limit, this experiment can be rerun.
+- **Code:** the option (`--decode-threading`, `--decode-threads`) was removed again to keep `run.py` small. It was about 10 lines: set `stream.codec_context.thread_count` and `stream.thread_type` before decoding.
 ---
 
 ## Speed log
@@ -714,6 +735,7 @@ Every timed run, in order, so each optimisation can be compared with the one bef
 | S-5 | 2026-11-20 | `staged-1>3>all-VPN` with the D-019 memory changes | sequential subset | 0 (RTX 6000), alone | 66 / 526,328 / 5.21 h | 1,054 s (17.6 min) | 499.5 | 0.0562 | ≈7.0 h | ≈0.73 h | output **byte-for-byte identical to S-3** on all 101 videos; equal to the simulator | Same as S-3 within 0.4%. 126,201 frames run, 4,494 predict calls, 0 OOM retries, peak buffer 990 frames / 326 MB (diverse part: 500 MB), 0 overflow seconds, peak RSS 5.42 GB. |
 | S-6 | 2026-11-20 | VPN + **FP16** (D-022) | sequential subset, 2 runs | 0 (RTX 6000), alone | 66 / 526,328 / 5.21 h | **658.3 s / 658.4 s (11.0 min)** | 799.5 | 0.0351 | ≈4.4 h | ≈0.46 h (27 min) | dev: F1 0.9938, exact 0.9928, within ±1 0.9999; holdout: 0.9947 / 0.9939 / 0.9999 | 126,169 frames run, 4,495 predict calls, 0 OOM retries, peak RSS 7.18 GB. The two runs are byte-for-byte identical. **1.60× faster than S-3/S-5; 5.8× faster than S-1.** Diverse: 360.8 s; holdout: 526.0 s (0.0367 s per video-s). |
 | S-7 | 2026-11-20 | VPN + FP16 + **threaded decoding** (D-023) | sequential subset, 2 runs interleaved with 2 serial controls (657.5 / 659.2 s) | 0 (RTX 6000), alone | 66 / 526,328 / 5.21 h | **533.8 s / 534.2 s (8.9 min)** | 985.6 | 0.0285 | ≈3.6 h | ≈0.37 h (22 min) | byte-identical to S-6 on dev and holdout; same inferred frame IDs | −18.9% against the serial controls. CPU 134%, peak RSS 7.9–8.1 GB, queue peak 512 MB. Diverse 299.0 s, holdout 427.6 s. **7.2× faster than S-1.** |
+| S-8 | 2026-11-21 | D-023 + decoder threading FRAME/AUTO (D-024) | profiling set (10 videos), screening only | 0 (RTX 6000), alone | 10 / 116,255 / — | 191.9–193.8 s across 5 configurations; controls 192.9 / 194.2 s | — | — | — | — | byte-identical; same inferred frames | **No gain (within ±0.6%). Rejected, not promoted.** |
 
 <!--
 Template for new entries (copy below this line):
