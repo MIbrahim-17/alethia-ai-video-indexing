@@ -44,6 +44,8 @@ These are requirements we can't change. They are listed so that any proposed dec
 | D-009 | Sudo policy | Accepted | 2026-11-20 |
 | D-010 | Local repo is the source of truth, pushed to the server with rsync | Accepted | 2026-11-20 |
 | D-011 | Server environment matched to the grading machine | Accepted | 2026-11-20 |
+| D-012 | How the diverse sample was picked, and the resulting subset | Accepted (frozen 2026-11-20) | 2026-11-20 |
+| D-013 | Synthetic fixture suite for unusual and damaged videos | Accepted | 2026-11-20 |
 
 ### D-001: Development and benchmark server
 - **Status:** Accepted · **Date:** 2026-11-20
@@ -177,6 +179,67 @@ These are requirements we can't change. They are listed so that any proposed dec
 - **Still to do:**
   - Simulate the offline timed run.
   - Test a clean `pip install -r requirements.txt` before submitting.
+
+### D-012: How the diverse sample was picked, and the resulting subset
+- **Status:** Accepted · **Date:** 2026-11-20 · Carries out D-006.
+- **Decision:**
+  - **Which Parquet files:** 10 files picked at random from index 50 to 1356, with seed `20261120`: `00267`, `00334`, `00486`, `00651`, `00841`, `00905`, `00919`, `00958`, `01113`, `01247`. They are stored in `data/finevideo_diverse/`.
+  - **How videos are described:** `validation/select_diverse_sample.py` probes the mp4 bytes themselves with PyAV. It records codec, pixel format, resolution, rotation, frame rate, whether the timing is variable (from packet timestamps), the first timestamp and the length. The `json` metadata is recorded only for comparison.
+  - **How videos are picked:** first, a greedy pass picks the videos whose attribute values are rarest, until every value seen is covered. Then the remaining places are filled with videos from the least-represented files. 35 videos are picked.
+  - **Output:** `validation/subset/diverse_manifest.json` lists the chosen videos and `validation/subset/probe_diverse.jsonl` holds the probe results for all 321 videos.
+- **Resulting subset:**
+
+  | Part | Videos | Hours | Frames |
+  |---|---|---|---|
+  | Sequential (`train-00000`, `train-00001`) | 66 | 5.21 | 526,328 |
+  | Diverse | 35 (from all 10 files, 3–4 each) | 2.38 | 240,937 |
+  | **Total** | **101** | **7.59** | **767,265** |
+- **What the probe found across all 387 videos:**
+  - All are H.264 yuv420p with constant frame rate, starting at timestamp 0.
+  - None has a rotation tag, and none has duplicate timestamps.
+  - Almost all are 360p or smaller; one has a short side of 552 px.
+  - Frame rates range from 15 to 30. 49 are portrait and 3 are square, all stored that way, not rotated by a tag.
+  - The `json` metadata matches the probe exactly on resolution and frame rate.
+- **Alternatives considered:** Picking evenly spaced files, which is no more representative than a seeded random pick. Picking videos purely at random within each file, which would miss rare cases such as frame rates below 20 or square videos.
+- **Consequences:**
+  - The natural data contains **none** of the "damaged or unusual" cases the brief warns about (brief §6): rotation tags, variable frame rate, timestamps not starting at 0, other codecs, corruption.
+  - Those cases have to be tested with synthetic videos made on purpose (validation layer 5, D-004). How to do that is still to be discussed.
+  - The resolution bucket labelled "720p" really means a short side of 481–720 px.
+- **Update 2026-11-20: the subset is frozen.**
+  - `validation/subset/frozen_subset.json` lists all 101 video IDs and records the size, row count and sha256 of each of the 12 source Parquet files.
+  - The hashes match the ones Hugging Face lists for these files, so the downloads are intact.
+  - All reference and benchmark work uses this manifest. Changing it needs a new decision.
+
+### D-013: Synthetic fixture suite for unusual and damaged videos
+- **Status:** Accepted (how the fixtures are made is still to be agreed) · **Date:** 2026-11-20 · Part of validation layer 5 (D-004).
+- **Context:** The natural FineVideo data contains none of the "damaged or unusual" cases in brief §6 (see D-012). The fixture suite is kept separate from the 101-video reference.
+- **Decision:** Fixtures are prioritised. **Every Critical fixture must pass before an optimisation is adopted.** High and Medium fixtures are secondary, because they cost more to build and run.
+
+  | Test case | Priority | What must be verified |
+  |---|---|---|
+  | Rotation metadata 90°, 180°, 270° | Critical | Correct orientation, applied exactly once |
+  | Variable frame rate | Critical | Correct second assignment from timestamps |
+  | Nonzero starting timestamp | Critical | The first decoded frame belongs to second 0 |
+  | Corrupted or truncated video | Critical | Completed results kept, error line written |
+  | Empty or null mp4 bytes | Critical | Error line, no pipeline crash |
+  | Non-video bytes | Critical | Error line, and the next video still processes |
+  | Audio-only file | Critical | "No video stream" handled correctly |
+  | Timestamp gap across seconds | Critical | Empty seconds written correctly |
+  | One-frame or sub-second video | Critical | The last second isn't left out |
+  | **Timestamps just before, exactly on and just after whole-second boundaries** | Critical | Exact assignment to a second |
+  | **Video that decodes several seconds and then fails** | Critical | Brief's partial-failure rule: earlier lines kept, plus one error line |
+  | Other resolutions and aspect ratios | High | Correct letterboxing |
+  | 60 fps | High | Every frame processed and counted |
+  | HEVC, VP9, AV1 | High | Supported files work, unsupported ones fail cleanly |
+  | Missing or duplicate timestamps | High | Clearly defined fallback or error behaviour |
+  | 1080p and 4K | Medium | Memory stays bounded |
+  | Multiple video streams | Medium | Consistent stream selection |
+- **Alternatives considered:**
+  - Relying on natural data only: none of these cases occur in it (D-012).
+  - Making every case mandatory: the expensive High and Medium fixtures would slow down each optimisation round.
+- **Consequences:**
+  - Each fixture needs an expected output that can be derived by hand or independently, not just "whatever the reference produces".
+  - Fixtures will be generated in code (PyAV) so they can be reproduced.
 
 <!--
 Template for new entries (copy below this line):
