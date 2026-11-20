@@ -321,6 +321,9 @@ These are requirements we can't change. They are listed so that any proposed dec
 
     `people > 0` in 71.6% of seconds. The person-present/`people = 0` case from a 50% tie occurs in 91 seconds.
 - **⚠ Rotation source refined by D-015:** read `frame.rotation` first, then fall back to the stream's `rotate` tag.
+- **Alternatives considered:**
+  - Using the stock `model.predict(source=video)` path. It decodes with cv2, gives no access to exact timestamps, and is harder to make resumable.
+  - Storing only per-second aggregates. That would lose the per-frame data that validation layers 2 and 3 need.
 
 ### D-015: Baseline `run.py` and scorer design
 - **Status:** Accepted · **Date:** 2026-11-20 · Carries out D-003, the first working version.
@@ -343,7 +346,7 @@ These are requirements we can't change. They are listed so that any proposed dec
   - It reports the brief's three metrics, the F1 variants in row 4, and breakdowns per video and per object.
 - **Result 2026-11-20 (baseline v1 measured):**
   - **Accuracy:** on all 101 videos (27,388 seconds), the output is **identical to the reference**. Every F1 and both people metrics are 1.0000, with no missing, extra or duplicate lines and no errors. Fixtures: 17 of 17 pass. Unit tests: 12 of 12 pass.
-  - **Timing** (GPU 0, the 2 complete sequential files, run with no options):
+  - **Timing** (GPU 0, the 2 complete sequential files, run with no options; logged as S-1 in the Speed log):
 
     | Measure | Value |
     |---|---|
@@ -362,8 +365,17 @@ These are requirements we can't change. They are listed so that any proposed dec
   - **Time-base check:** all 767,265 reference frames have `frame.time_base == stream.time_base`, so the reference stays valid with C4.
   - **Where the time goes:** decoding alone is cheap. Decoding all 767k frames took about 67 CPU-seconds in total (about 11,000 fps per core, without converting to arrays). So the baseline is limited by inference and its single-threaded preprocessing (GPU at about 90%, one CPU core).
 - **Noted for optimisation later, not part of the baseline:** shrinking frames early, but only with exactly the same resize Ultralytics uses (the same size, `cv2.resize` INTER_LINEAR). It must pass validation layer 2 first.
- It decodes with cv2, gives no access to exact timestamps, and is harder to make resumable.
-  - Storing only per-second aggregates. That would lose the per-frame data that validation layers 2 and 3 need.
+
+---
+
+## Speed log
+
+Every timed run, in order, so each optimisation can be compared with the one before it. A run only counts toward a decision if it is on GPU 0 (D-007) and its output passes validation (D-004). "s per video-s" is wall time divided by video length. The estimates scale that ratio linearly and don't include model loading.
+
+| # | Date | Version (decision) | Run | GPU | Videos / frames / video length | Wall | Decoded fps | s per video-s | Est. full 50 files (≈125 h) | Est. 13 h test set | Accuracy vs reference | Notes |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| S-1 | 2026-11-20 | Baseline v1, every frame, batch 32, FP32 PyTorch (D-015) | sequential subset (`train-00000`, `train-00001`) | 0 (RTX 6000) | 66 / 526,328 / 5.21 h | 3,833 s (63.9 min) | 137.3 | 0.204 | ≈25.5 h | ≈2.7 h | identical (all metrics 1.0000) | CPU 105% (one core), peak RSS 3.9 GB, GPU ≈90%. GPU 1 busy with S-2 for the first 33 min. **The timing figure of record for the baseline.** |
+| S-2 | 2026-11-20 | Baseline v1 (D-015) | diverse subset (10 files) | 1 (RTX 6000, ≈10.7 GB held by ollama) | 35 / 240,937 / 2.38 h | 1,988 s (33.1 min) | 121.2 | 0.232 | — | — | identical (all metrics 1.0000) | Run for accuracy only. GPU 1 is not the benchmark GPU, so this timing isn't compared with others. |
 
 <!--
 Template for new entries (copy below this line):
