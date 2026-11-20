@@ -43,6 +43,7 @@ These are requirements we can't change. They are listed so that any proposed dec
 | D-008 | Disk budget: 54 GB on the `ibrahim` root only | Accepted | 2026-11-20 |
 | D-009 | Sudo policy | Accepted | 2026-11-20 |
 | D-010 | Local repo is the source of truth, pushed to the server with rsync | Accepted | 2026-11-20 |
+| D-011 | Server environment matched to the grading machine | Accepted | 2026-11-20 |
 
 ### D-001: Development and benchmark server
 - **Status:** Accepted · **Date:** 2026-11-20
@@ -142,6 +143,40 @@ These are requirements we can't change. They are listed so that any proposed dec
 - **Consequences:**
   - Results generated on the server, such as reference outputs and benchmark logs, have to be pulled back on purpose.
   - Secrets never reach the server through the sync. The server has its own `hf auth login`.
+  - `weights/`, `*.pt` and `*.engine` are also left out of the sync and git. This keeps server-side model files safe from `--delete`. (Added 2026-11-20.)
+
+### D-011: Server environment matched to the grading machine
+- **Status:** Accepted · **Date:** 2026-11-20
+- **Context:** The user asked for the server to match the grading environment as closely as possible (brief §6), so that optimisation results carry over.
+- **Decision:**
+
+  | Item | Choice |
+  |---|---|
+  | Python | 3.11.16, installed with `uv`, in `~/alethia/.venv` |
+  | PyTorch | `torch==2.14.1+cu126`, `torchvision==0.29.1+cu126`, from the PyTorch cu126 index |
+  | Other packages | `ultralytics==8.4.215`, `pyarrow==26.0.1`, `av==18.1.0`, `numpy==2.4.6`, `opencv-python==5.1.0.95` (pulled in by Ultralytics), cuDNN 9.10.2 |
+  | Weights | Official `yolo11l.pt` from Ultralytics assets v8.4.0, sha256 `9ebd0e09…0023f`, stored in `weights/` |
+- **Why the cu126 build:**
+  - The grading driver only promises "CUDA 12". CUDA 12.6 needs an older driver than 12.8 or 12.9, so it has the widest compatibility.
+  - cu126 also had the newest PyTorch release of the three CUDA 12 builds.
+  - The build includes `sm_75` code for the RTX 6000 here. It includes `sm_86` code but not `sm_89`. NVIDIA GPUs can run code built for an earlier minor architecture of the same generation, so the `sm_86` code will run on the 4090 (`sm_89`).
+- **Alternatives considered:**
+  - `cu128` (only up to torch 2.11) and `cu129` (torch 2.13): both need newer drivers.
+  - `cu13x` builds: excluded by the brief's CUDA 12.
+  - Docker with an Ubuntu 22.04 image: the graders have no Docker, so it wouldn't be the same setup anyway.
+- **Smoke test:** YOLO11l at size 640 with confidence 0.4 runs on GPU 0, at about 10.6 ms per frame (unbatched, FP32, random 720p input).
+- **Known differences we accept:**
+  - The OS is Ubuntu 26.04 rather than 22.04.
+  - The GPU is a Turing RTX 6000 rather than an Ada 4090.
+  - RAM is 61 GB rather than 64 GB.
+- **Update 2026-11-20 (headless OpenCV):**
+  - Replaced `ultralytics` and `opencv-python` with the official `ultralytics-opencv-headless==8.4.215`, which pulls in `opencv-python-headless==5.1.0.95`.
+  - Reason: `opencv-python` needs the system library `libGL`, which a fresh Ubuntu 22.04 VM may not have, and then importing it fails. Checked with `ldd`: the headless `cv2` doesn't depend on libGL, X11 or Qt.
+  - Rejected alternative: keeping `opencv-python` and listing `apt-get install libgl1` in the README. That adds a system dependency and a way for the run to fail.
+  - `requirements.txt` must pin `ultralytics-opencv-headless`, not `ultralytics`. Otherwise pip installs `opencv-python` again.
+- **Still to do:**
+  - Simulate the offline timed run.
+  - Test a clean `pip install -r requirements.txt` before submitting.
 
 <!--
 Template for new entries (copy below this line):

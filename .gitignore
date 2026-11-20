@@ -1,2 +1,11 @@
 .env
 .env.*
+AI_Engineering_TakeHome_Brief.pdf
+.venv/
+__pycache__/
+weights/
+*.pt
+*.engine
+data/
+finevideo/
+work/
