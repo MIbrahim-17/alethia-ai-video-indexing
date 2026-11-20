@@ -49,8 +49,9 @@ These are requirements we can't change. They are listed so that any proposed dec
 | D-014 | Every-frame reference builder design | Accepted (3 items pending confirmation) | 2026-11-20 |
 | D-015 | Baseline `run.py` and scorer design | Accepted (baseline v1 measured 2026-11-20) | 2026-11-20 |
 | D-016 | Frame sampling: techniques tested and results | Experiment done (strategy chosen in D-017) | 2026-11-20 |
-| D-017 | Staged sampling `staged-1>3>all-VPN` in `run.py` | Accepted, provisional (holdout passed 2026-11-20) | 2026-11-20 |
+| D-017 | Staged sampling `staged-1>3>all-VPN` in `run.py` | Accepted, **final** (approved by the user 2026-11-20) | 2026-11-20 |
 | D-018 | Untouched correctness holdout | Accepted | 2026-11-20 |
+| D-019 | Memory bounds and CUDA OOM recovery | Accepted | 2026-11-20 |
 
 ### D-001: Development and benchmark server
 - **Status:** Accepted · **Date:** 2026-11-20
@@ -464,6 +465,7 @@ These are requirements we can't change. They are listed so that any proposed dec
   - `staged-1>3>9>all-VN` (faster, people exact about 0.966); documented only (D-016 update).
   - Decoding each video twice instead of buffering frames: simpler memory use, but double decoding.
 - **Update 2026-11-20:** it passes the untouched holdout (D-018): F1 gate 0.9947, people exact 0.9950, within ±1 0.9999, identical to the simulator. It's still provisional, as the user asked, and stays the default until the user confirms it or a later change (for example the inference engine) forces a re-check.
+- **Update 2026-11-20: approved by the user as the final sampling strategy.** Any later change that alters detections (for example FP16 or TensorRT) must still re-run the D-017 and D-018 checks. The strategy itself is no longer open.
 
 ### D-018: Untouched correctness holdout
 - **Status:** Accepted · **Date:** 2026-11-20 · Validation layer 5 (D-004).
@@ -490,6 +492,54 @@ These are requirements we can't change. They are listed so that any proposed dec
   - A holdout from the 50 graded files: those are the final output, and the brief's test set is hidden, so a separate set is cleaner.
   - Feature-weighted selection: it's biased toward rare cases. The diverse sample already covers those.
 - **Consequences:** about 3.9 GB of disk (46 GB free afterwards).
+### D-019: Memory bounds and CUDA OOM recovery
+- **Status:** Accepted · **Date:** 2026-11-20 · Extends D-015 C5 and D-017. Requested by the user: verify cache release, bounded frame caches, safety on high-resolution input, and OOM recovery.
+- **Problems found while checking:**
+  1. **One second was unbounded.** The chunk limits (32 seconds or about 1 GB) were checked only when a second ended, so a single second with very many frames was buffered whole. Example: 3,000 4K frames in one second is about 37 GB of YUV.
+  2. **The OOM retry ran inside the `except` block.** The live traceback still referenced the failed attempt's GPU tensors while the smaller batches ran. **Measured with the old handler** (32 real 4K frames, GPU limited to base + 1.3 × the memory of a batch of 4):
+     - the retries started with 130 → 220 → 266 → 288 → 397 → 399 MB allocated, against a 130 MB base;
+     - it **failed even on a single frame**.
+  3. **Ultralytics keeps the last batch between calls.** `predictor.batch`, `predictor.results` (each Result holds its original image) and `predictor.dataset` stay referenced, which is up to about 800 MB at 4K. They are rebuilt on every call, so dropping them is safe.
+  4. After an OOM, every later batch started at 32 again and hit the OOM again.
+- **Decision (`run.py`):**
+  - **A per-second cap, `SECOND_BYTES_CAP` = 512 MB.**
+    - A second that grows past it is marked *overflow*: each frame is run as it's decoded (in batches of 32) and released straight away.
+    - Its result therefore uses every frame, the same as the reference rule.
+    - Its stage-1 result, which its neighbours' N test uses, still comes from its middle frame only, so neighbouring seconds are decided exactly as the simulator decides them.
+    - This only applies to seconds over 512 MB. A 4K 30 fps second is about 373 MB, so even 4K stays on the sampled path.
+  - **Release when a second is written:** its frames and per-frame results are dropped (`frames = []`, `res = {}`), and nothing else references the second. The decode generator is closed and the last frame's reference dropped once the video ends.
+  - **OOM handling:**
+    - The retry happens only after leaving the `except` block, so the traceback is gone.
+    - Then the predictor's state is dropped, garbage is collected and the CUDA cache is emptied.
+    - The batch size is halved **per image shape**, and later batches of that shape keep the smaller size.
+    - An OOM on a single frame is a VideoError for that video only.
+    - A `RuntimeError` saying "out of memory" counts as an OOM too.
+  - `Detector._predict` drops the predictor's state after every call, successful or not.
+  - **Stats:** `peak_buffered_frames`, `peak_buffered_mb`, `overflow_seconds` and `oom_retries` appear in the DONE line.
+- **Bound on decoded-frame memory:** below `CHUNK_BYTES + SECOND_BYTES_CAP + one frame`, about 1.5 GB. On top of that, one BGR batch of at most 32 frames or 1 GB is converted for the model.
+- **Verification (2026-11-20):**
+  - **Unit tests (fakes), 21 of 21 pass, 3 of them new:**
+    - **Release:** weak references to every frame show that, after every `process()` call, no frame of a written second is alive, and none is alive after the video. Checked on 10 random videos.
+    - **Bounded 4K buffer:** 90 s of 4K (about 33 GB if buffered whole) peaks within the bound, and the output equals the simulator's.
+    - **Oversized second:** 3,000 4K frames in one second. It overflows once, the frames held stay within the cap plus one batch, that second equals the every-frame result, and all the other seconds equal the simulator's.
+    - **The tests can fail:** with a planted leak (written seconds kept in a list) and no explicit release, 3 tests fail. With the release kept, they pass, because the release protects even when something else keeps a reference.
+  - **Real decoding and GPU (`validation/test_memory.py`):**
+    - **A (bounds):** real H.264 at 3840×2160 30 fps (60 s), a 1080p video with 1,500 frames in one second, and the 4K video 7 more times, all in one `run.py` process.
+      - Peak buffer 1,068 MB, below the 1,548 MB bound. 1 overflow second, 0 errors.
+      - Peak RSS per video (GB): 3.17, 3.13, 3.82, 3.81, 3.86, 3.85, 3.93, 3.90, 3.91. It **levels off** (the last 4 are within 0.08 GB) and doesn't grow per video.
+    - **B (release):** the same videos in-process, with each real frame wrapped in a weak-referenceable proxy. 0 frames of written seconds alive, 0 alive after each video (1,800 and 1,620 frames).
+    - **C (OOM recovery):** the real model under the GPU limit above.
+      - Attempts with 32 → 16 → 8 → 4, each starting at **exactly 130 MB** (the base); 3 OOMs.
+      - Results identical to the unlimited run. Memory back to 130 MB afterwards, and the predictor holds no batch.
+      - A single-frame OOM gives "CUDA out of memory on a single frame", memory returns to the base, and the detector works normally afterwards.
+- **Alternatives considered:**
+  - Dropping an oversized second, or sampling it from a partial buffer: this would change results away from the brief's rule.
+  - Decoding each video twice to avoid buffering: double the decode cost.
+  - A global cap on frames instead of bytes: wrong for mixed resolutions (D-015 C5).
+- **Consequences:**
+  - An oversized second costs every frame's inference. It never happens on real data: S-5 had 0 overflow seconds in 101 videos.
+  - **Regression check (S-5):** the output on all 101 videos is byte-for-byte identical to S-3, the timing matches within 0.4%, and 17 of 17 fixtures pass in both modes.
+  - The every-frame fallback path uses the same Detector, so it gets the same OOM fix.
 ---
 
 ## Speed log
@@ -503,6 +553,7 @@ Every timed run, in order, so each optimisation can be compared with the one bef
 | S-3 | 2026-11-20 | Staged sampling `staged-1>3>all-VPN` (D-017) | sequential subset (`train-00000`, `train-00001`) | 0 (RTX 6000), alone | 66 / 526,328 / 5.21 h | **1,049 s (17.5 min)**; 17:30 for the whole process | 501.6 (frames run per second of wall time: 120.3) | 0.0559 | ≈7.0 h | ≈0.73 h (44 min) | F1 gate 0.9947, exact 0.9940, within ±1 0.9999 on all 101 videos; identical to the simulator | 126,201 frames run (24.0%), 4,494 predict calls, CPU 105%, peak RSS 5.43 GB. **3.65× faster than S-1.** |
 | S-3b | 2026-11-20 | Same as S-3 | diverse subset (10 files) | 0 (RTX 6000) | 35 / 240,937 / 2.38 h | 541 s (9.0 min) | 445.1 | 0.0632 | — | — | (pooled with S-3 above) | 65,647 frames run (27.2%), 2,335 predict calls, peak RSS 5.51 GB. The holdout download (network only) overlapped this run, so it's for information only. |
 | S-4 | 2026-11-20 | `staged-1>3>all-VPN` (D-017) | holdout (D-018) | 0 (RTX 6000), alone | 48 / 403,553 / 3.98 h | 827 s (13.8 min) | 487.7 | 0.0577 | ≈7.2 h | ≈0.75 h | holdout: F1 gate 0.9947, exact 0.9950, within ±1 0.9999 | 96,149 frames run (23.8%), 3,445 predict calls, peak RSS 5.58 GB. Agrees with S-3 (0.0559 s per video-s). |
+| S-5 | 2026-11-20 | `staged-1>3>all-VPN` with the D-019 memory changes | sequential subset | 0 (RTX 6000), alone | 66 / 526,328 / 5.21 h | 1,054 s (17.6 min) | 499.5 | 0.0562 | ≈7.0 h | ≈0.73 h | output **byte-for-byte identical to S-3** on all 101 videos; equal to the simulator | Same as S-3 within 0.4%. 126,201 frames run, 4,494 predict calls, 0 OOM retries, peak buffer 990 frames / 326 MB (diverse part: 500 MB), 0 overflow seconds, peak RSS 5.42 GB. |
 
 <!--
 Template for new entries (copy below this line):

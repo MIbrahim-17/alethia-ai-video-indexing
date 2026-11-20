@@ -131,7 +131,9 @@ def frame_to_bgr(vf, k: int):
 
 
 def frame_bytes(vf) -> int:
-    """About how much memory a buffered YUV 4:2:0 frame holds."""
+    """About how much memory a buffered YUV 4:2:0 frame holds (0 for a released frame)."""
+    if vf is None:
+        return 0
     try:
         return vf.width * vf.height * 3 // 2
     except AttributeError:
@@ -191,44 +193,88 @@ class Detector:
         name_to_id = {v: k for k, v in self.model.names.items()}
         self.target_of = {name_to_id[n]: i for i, n in enumerate(TARGETS)}
         self.device = 0 if torch.cuda.is_available() else "cpu"
+        self.n_calls = self.n_frames = self.n_oom = 0
+        self.batch_cap: dict[tuple, int] = {}  # image shape -> largest batch size known to fit (after an OOM)
 
-        self.n_calls = self.n_frames = 0
+    def _release_predictor_state(self):
+        """Ultralytics keeps the last batch's images and results on the predictor between calls
+        (`batch`, `results`, `dataset`; it rebuilds them on every call). Drop them so a
+        finished or failed batch isn't kept in memory."""
+        p = getattr(self.model, "predictor", None)
+        if p is not None:
+            p.batch = p.results = p.dataset = None
 
     def _predict(self, imgs):
-        """Run predict on runs of same-shape images only, so Ultralytics's `auto` letterbox
-        is the same as for single frames (D-015 C2). Real videos never change shape."""
-        out, i = [], 0
-        while i < len(imgs):
-            j = i + 1
-            while j < len(imgs) and imgs[j].shape == imgs[i].shape:
-                j += 1
-            out += self.model.predict(imgs[i:j], device=self.device, **PREDICT_KW)
-            self.n_calls += 1
-            self.n_frames += j - i
-            i = j
+        """One predict call on same-shape images (D-015 C2)."""
+        try:
+            out = self.model.predict(imgs, device=self.device, **PREDICT_KW)
+        finally:
+            self._release_predictor_state()
+        self.n_calls += 1
+        self.n_frames += len(imgs)
         return out
 
+    def _summarise(self, r) -> tuple[list[bool], int]:
+        present = [False] * len(TARGETS)
+        n_people = 0
+        for c in r.boxes.cls.tolist():
+            k = self.target_of.get(int(c))
+            if k is not None:
+                present[k] = True
+                n_people += k == PERSON
+        return present, n_people
+
+    @staticmethod
+    def _is_oom(e: BaseException) -> bool:
+        import torch
+        return isinstance(e, torch.cuda.OutOfMemoryError) or (
+            isinstance(e, RuntimeError) and "out of memory" in str(e).lower())
+
     def detect(self, imgs) -> list[tuple[list[bool], int]]:
-        """For each image: (which targets are present, person count). On CUDA out-of-memory, halve the batch and retry (D-015 C5)."""
-        try:
-            results = self._predict(imgs)
-        except self.torch.cuda.OutOfMemoryError:
-            self.torch.cuda.empty_cache()
-            if len(imgs) == 1:
-                raise VideoError("CUDA out of memory on a single frame")
-            mid = len(imgs) // 2
-            return self.detect(imgs[:mid]) + self.detect(imgs[mid:])
-        out = []
-        for r in results:
-            present = [False] * len(TARGETS)
-            n_people = 0
-            for c in r.boxes.cls.tolist():
-                k = self.target_of.get(int(c))
-                if k is not None:
-                    present[k] = True
-                    n_people += k == PERSON
-            out.append((present, n_people))
+        """For each image: (which targets are present, person count).
+
+        Images are sent in runs of the same shape, never more than the batch size known to
+        fit for that shape. On CUDA out-of-memory (D-015 C5, D-019):
+          - the retry happens only after leaving the `except` block, so the exception's
+            traceback, which references the failed attempt's GPU tensors, is already gone;
+          - the predictor's leftover state is dropped, garbage is collected and the CUDA
+            cache is emptied;
+          - the batch size for that shape is halved, and stays halved for later batches;
+          - an OOM on a single frame is a VideoError for this video only.
+        """
+        out, i = [], 0
+        while i < len(imgs):
+            shape = imgs[i].shape
+            j = i + 1
+            while j < len(imgs) and imgs[j].shape == shape:
+                j += 1
+            n = min(j - i, self.batch_cap.get(shape, j - i))
+            failed = False
+            try:
+                results = self._predict(imgs[i:i + n])
+            except Exception as e:  # noqa: BLE001
+                if not self._is_oom(e):
+                    raise
+                failed = True
+            if failed:  # outside the except block: the traceback has been released
+                self.n_oom += 1
+                self._recover_from_oom()
+                if n == 1:
+                    raise VideoError("CUDA out of memory on a single frame")
+                self.batch_cap[shape] = n // 2
+                continue
+            out += [self._summarise(r) for r in results]
+            del results
+            i += n
         return out
+
+    def _recover_from_oom(self):
+        import gc
+
+        self._release_predictor_state()
+        gc.collect()
+        if self.torch.cuda.is_available():
+            self.torch.cuda.empty_cache()
 
 
 # ---------------------------------------------------------------- per video
@@ -283,6 +329,9 @@ SAMPLING = {
 DEFAULT_SAMPLING = "staged-1>3>all-VPN"
 CHUNK_SECONDS = 32           # seconds buffered before running the model on them
 CHUNK_BYTES = 1 << 30        # and at most about 1 GB of buffered YUV frames (D-015 C5)
+SECOND_BYTES_CAP = 512 << 20  # a single second holding more than this is run on every frame,
+                              # streamed in batches, so it is never buffered whole (D-019)
+STATS = {"peak_buffered_bytes": 0, "peak_buffered_frames": 0, "overflow_seconds": 0}
 
 
 def uniform_positions(n: int, k: int) -> list[int]:
@@ -296,14 +345,21 @@ def uniform_positions(n: int, k: int) -> list[int]:
 
 
 class _Second:
-    __slots__ = ("s", "frames", "res", "stage1", "unsure")
+    __slots__ = ("s", "frames", "res", "stage1", "unsure", "overflow")
 
     def __init__(self, s: int):
         self.s = s
-        self.frames = []     # (decoded frame, rotation k), in time order
+        self.frames = []     # (decoded frame, rotation k) in time order; None once released
         self.res = {}        # position -> (present list, person count) for frames run so far
         self.stage1 = None   # (present tuple, people) from the first stage
         self.unsure = False
+        self.overflow = False  # too big to buffer: every frame is run as it arrives
+
+
+def _held(sec: _Second) -> tuple[int, int]:
+    """(bytes, frames) of decoded frames this second still holds."""
+    held = [f for f in sec.frames if f is not None]
+    return sum(frame_bytes(vf) for vf, _ in held), len(held)
 
 
 def _agg(results) -> tuple[tuple[bool, ...], int]:
@@ -342,14 +398,67 @@ def _run_positions(det, todo):
 
 
 class StagedVideo:
-    """Staged sampling for one video, with one second of look-ahead for the N test."""
+    """Staged sampling for one video, with one second of look-ahead for the N test.
+
+    Memory (D-019): decoded frames are held only for buffered seconds. At most
+    CHUNK_SECONDS + 1 complete seconds or about CHUNK_BYTES are buffered before they are
+    processed, and a second's frames and results are dropped as soon as its line is
+    written. A second larger than SECOND_BYTES_CAP is run on every frame while it is
+    being decoded (in batches), so it never holds more than the cap plus one batch.
+    """
 
     def __init__(self, acc: SecondAccumulator, det, stages, flags):
         self.acc, self.det, self.stages, self.flags = acc, det, stages, flags
         self.pending: list[_Second] = []   # complete seconds not yet written, in order
         self.prev_stage1 = None            # stage-1 result of the last written second
-        self.buffered_bytes = 0
+        self.buffered_bytes = self.buffered_frames = 0   # held by self.pending
+        self.cur: _Second | None = None    # the second being decoded
+        self.cur_bytes = self.cur_frames = 0
 
+    # -- decoding side
+    def add_frame(self, s: int, vf, k: int):
+        if self.cur is None or s > self.cur.s:
+            self.close_current()
+            self.cur = _Second(s)
+            self.cur_bytes = self.cur_frames = 0
+        c = self.cur
+        c.frames.append((vf, k))
+        self.cur_bytes += frame_bytes(vf)
+        self.cur_frames += 1
+        self._note_peak()
+        if not c.overflow and self.cur_bytes > SECOND_BYTES_CAP:
+            c.overflow = True
+            STATS["overflow_seconds"] += 1
+        if c.overflow:
+            self._run_overflow(c, force=False)
+
+    def _run_overflow(self, c: _Second, force: bool):
+        """Every frame of an overflow second is run; release each frame once it has been."""
+        todo = [(c, p) for p, f in enumerate(c.frames) if f is not None and p not in c.res]
+        if todo and (force or len(todo) >= MAX_BATCH_FRAMES):
+            _run_positions(self.det, todo)
+            for _, p in todo:
+                c.frames[p] = None
+            self.cur_bytes, self.cur_frames = _held(c)
+
+    def close_current(self):
+        if self.cur is None:
+            return
+        c, self.cur = self.cur, None
+        if c.overflow:
+            self._run_overflow(c, force=True)
+        self.cur_bytes = self.cur_frames = 0
+        self.add_second(c)
+
+    def _note_peak(self):
+        b = self.buffered_bytes + self.cur_bytes
+        f = self.buffered_frames + self.cur_frames
+        if b > STATS["peak_buffered_bytes"]:
+            STATS["peak_buffered_bytes"] = b
+        if f > STATS["peak_buffered_frames"]:
+            STATS["peak_buffered_frames"] = f
+
+    # -- inference side
     def add_second(self, sec: _Second):
         if self.pending and sec.s > self.pending[-1].s + 1:  # seconds with no frames
             for g in range(self.pending[-1].s + 1, sec.s):
@@ -358,9 +467,16 @@ class StagedVideo:
             for g in range(0, sec.s):
                 self.pending.append(_Second(g))
         self.pending.append(sec)
-        self.buffered_bytes += sum(frame_bytes(vf) for vf, _ in sec.frames)
+        b, f = _held(sec)
+        self.buffered_bytes += b
+        self.buffered_frames += f
+        self._note_peak()
         if len(self.pending) > CHUNK_SECONDS or self.buffered_bytes >= CHUNK_BYTES:
             self.process(final=False)
+
+    def finish(self):
+        self.close_current()
+        self.process(final=True)
 
     def process(self, final: bool):
         """Run the stages on the buffered seconds and write all whose neighbours are known."""
@@ -374,8 +490,8 @@ class StagedVideo:
                 todo += [(sec, p) for p in uniform_positions(len(sec.frames), k1) if p not in sec.res]
         _run_positions(self.det, todo)
         for sec in self.pending:
-            if sec.stage1 is None:
-                sec.stage1 = _agg(list(sec.res.values()))
+            if sec.stage1 is None:  # from the stage-1 frames only (an overflow second has run all)
+                sec.stage1 = _agg([sec.res[p] for p in uniform_positions(len(sec.frames), k1)])
         # The last second waits for its next neighbour unless the video has ended.
         ready = self.pending if final else self.pending[:-1]
         for i, sec in enumerate(ready):
@@ -408,10 +524,14 @@ class StagedVideo:
                 self.acc.add(sec.s, present, n_people)
         if ready:
             self.prev_stage1 = ready[-1].stage1
-        self.pending = self.pending[len(ready):]
-        self.buffered_bytes = sum(frame_bytes(vf) for sec in self.pending for vf, _ in sec.frames)
-        for sec in ready:
+        for sec in ready:  # release: written seconds keep no frames and no per-frame results
             sec.frames = []
+            sec.res = {}
+        del ready
+        self.pending = self.pending[-1:] if not final else []
+        held = [_held(x) for x in self.pending]
+        self.buffered_bytes = sum(h[0] for h in held)
+        self.buffered_frames = sum(h[1] for h in held)
 
 
 def process_video_staged(video: str, mp4, det, w: Writer, keep_partial: bool, stages, flags) -> int:
@@ -421,7 +541,7 @@ def process_video_staged(video: str, mp4, det, w: Writer, keep_partial: bool, st
     try:
         if not mp4:
             raise VideoError("empty or missing mp4 bytes")
-        cur, decode_err = None, None
+        decode_err = None
         gen = iter_raw_frames(mp4)
         while True:
             try:
@@ -432,18 +552,14 @@ def process_video_staged(video: str, mp4, det, w: Writer, keep_partial: bool, st
                 decode_err = e  # frames decoded before the failure are still used
                 break
             s = math.floor(t)
-            if s < 0 or (cur is not None and s < cur.s):
+            if s < 0 or (sv.cur is not None and s < sv.cur.s):
                 decode_err = VideoError(f"frame timestamp goes back to second {s}")
                 break
-            if cur is None or s > cur.s:
-                if cur is not None:
-                    sv.add_second(cur)
-                cur = _Second(s)
-            cur.frames.append((vf, k))
+            sv.add_frame(s, vf, k)
+            del vf
             n_frames += 1
-        if cur is not None:
-            sv.add_second(cur)
-        sv.process(final=True)
+        gen.close()
+        sv.finish()
         if decode_err is not None:
             raise decode_err
         acc.finish(keep_partial=True)
@@ -524,7 +640,10 @@ def main():
     w.close()
     dt = time.time() - t_start
     print(f"DONE sampling={a.sampling} files={len(files)} videos={n_videos} frames={n_frames} "
-          f"inferred={det.n_frames} predict_calls={det.n_calls} "
+          f"inferred={det.n_frames} predict_calls={det.n_calls} oom_retries={det.n_oom} "
+          f"peak_buffered_frames={STATS['peak_buffered_frames']} "
+          f"peak_buffered_mb={STATS['peak_buffered_bytes'] / 2**20:.0f} "
+          f"overflow_seconds={STATS['overflow_seconds']} "
           f"seconds={w.n_seconds} errors={w.n_errors} file_problems={len(file_problems)} "
           f"wall={dt:.1f}s fps={n_frames / max(dt, 1e-9):.1f}", file=sys.stderr)
     for m in file_problems:

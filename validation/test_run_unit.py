@@ -273,6 +273,91 @@ def test_staged_first_frame_failure_and_empty():
     assert w.lines() == [{"video": "v:0", "error": "empty or missing mp4 bytes"}]
 
 
+# ---------------------------------------------------------------- memory (D-019)
+
+class _BigImg(_RawImg):
+    """A fake frame that reports a 4K size, so the byte accounting sees real-sized frames."""
+    width, height = 3840, 2160
+
+
+def _run_tracked(spec, frame_cls=_BigImg):
+    """Run the staged path and check, after every process() call, that every frame of every
+    second already written is no longer referenced anywhere (weak references are dead)."""
+    import gc
+    import weakref
+    refs = {}  # second -> weak references to its frames
+    violations = []
+    w, det = FakeWriter(), CountingDetector()
+    orig = run.iter_raw_frames, run.frame_to_bgr, run.StagedVideo.process
+
+    def gen(_mp4):
+        for i, (t, boxes) in enumerate(spec):
+            f = frame_cls(boxes, i)
+            refs.setdefault(int(t // 1), []).append(weakref.ref(f))
+            yield Fraction(t), f, 0
+
+    def tracked_process(self, final):
+        orig[2](self, final)
+        alive_from = min([x.s for x in self.pending] + ([self.cur.s] if self.cur else []) + [10**9])
+        for s, rs in refs.items():
+            if s < alive_from and any(r() is not None for r in rs):
+                violations.append(s)
+
+    run.iter_raw_frames, run.frame_to_bgr, run.StagedVideo.process = gen, (lambda vf, k: vf), tracked_process
+    for k in run.STATS:
+        run.STATS[k] = 0
+    try:
+        run.process_video_staged("v:0", b"x", det, w, True, (1, 3, 0), "VPN")
+    finally:
+        run.iter_raw_frames, run.frame_to_bgr, run.StagedVideo.process = orig
+    gc.collect()
+    leftover = sum(r() is not None for rs in refs.values() for r in rs)
+    return w.lines(), det, sorted(set(violations)), leftover
+
+
+def test_frames_released_once_second_written():
+    import numpy as np
+    rng = np.random.default_rng(11)
+    for _ in range(10):
+        spec = _random_video(rng, int(rng.integers(40, 120)))
+        lines, _, violations, leftover = _run_tracked(spec, _RawImg)
+        assert violations == [], f"frames of written seconds still referenced: {violations[:5]}"
+        assert leftover == 0, f"{leftover} frames still referenced after the video"
+
+
+def test_buffer_bounded_for_4k_frames():
+    # 90 s of 4K at 30 fps: about 33 GB of YUV if it were all buffered.
+    spec = [(Fraction(i, 30), [P] if (i // 30) % 7 else []) for i in range(90 * 30)]
+    lines, _, violations, leftover = _run_tracked(spec)
+    fb = 3840 * 2160 * 3 // 2
+    bound = run.CHUNK_BYTES + run.SECOND_BYTES_CAP + fb
+    assert run.STATS["peak_buffered_bytes"] <= bound, run.STATS
+    assert violations == [] and leftover == 0
+    assert [s for s, *_ in secs(lines)] == list(range(90))
+    want, _ = _simulator_output(spec, (1, 3, 0), "VPN")
+    assert secs(lines) == want  # bounding the buffer doesn't change any result
+
+
+def test_oversized_second_is_streamed_not_buffered():
+    # Second 1 holds 3,000 4K frames (about 37 GB of YUV); seconds 0 and 2..5 are normal.
+    spec = [(Fraction(i, 30), [P]) for i in range(30)]
+    spec += [(1 + Fraction(i, 3000), [P] * (1 + i % 3)) for i in range(3000)]
+    spec += [(2 + Fraction(i, 30), [P, P]) for i in range(4 * 30)]
+    lines, det, violations, leftover = _run_tracked(spec)
+    fb = 3840 * 2160 * 3 // 2
+    max_frames = run.SECOND_BYTES_CAP // fb + run.MAX_BATCH_FRAMES + 2
+    assert run.STATS["overflow_seconds"] == 1, run.STATS
+    assert run.STATS["peak_buffered_frames"] <= 30 + max_frames, run.STATS
+    assert violations == [] and leftover == 0
+    # The oversized second is computed from every frame, so it equals the reference rule;
+    # the other seconds equal the simulator.
+    want, _ = _simulator_output(spec, (1, 3, 0), "VPN")
+    got = secs(lines)
+    full = run_video(spec)
+    assert got[1] == secs(full)[1], (got[1], secs(full)[1])
+    assert [g for g in got if g[0] != 1] == [x for x in want if x[0] != 1]
+
+
 def test_uniform_positions_match_simulator_float_rule():
     for n in range(0, 400):
         for k in (1, 3, 5, 9, 15):
