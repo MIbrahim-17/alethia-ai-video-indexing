@@ -1,0 +1,65 @@
+{
+ "rule": "frozen_subset sequential videos [::7]",
+ "videos": [
+  {
+   "video": "train-00000-of-01357.parquet:0",
+   "file": "train-00000-of-01357.parquet",
+   "row": 0,
+   "part": "sequential"
+  },
+  {
+   "video": "train-00000-of-01357.parquet:7",
+   "file": "train-00000-of-01357.parquet",
+   "row": 7,
+   "part": "sequential"
+  },
+  {
+   "video": "train-00000-of-01357.parquet:14",
+   "file": "train-00000-of-01357.parquet",
+   "row": 14,
+   "part": "sequential"
+  },
+  {
+   "video": "train-00000-of-01357.parquet:21",
+   "file": "train-00000-of-01357.parquet",
+   "row": 21,
+   "part": "sequential"
+  },
+  {
+   "video": "train-00000-of-01357.parquet:28",
+   "file": "train-00000-of-01357.parquet",
+   "row": 28,
+   "part": "sequential"
+  },
+  {
+   "video": "train-00001-of-01357.parquet:2",
+   "file": "train-00001-of-01357.parquet",
+   "row": 2,
+   "part": "sequential"
+  },
+  {
+   "video": "train-00001-of-01357.parquet:9",
+   "file": "train-00001-of-01357.parquet",
+   "row": 9,
+   "part": "sequential"
+  },
+  {
+   "video": "train-00001-of-01357.parquet:16",
+   "file": "train-00001-of-01357.parquet",
+   "row": 16,
+   "part": "sequential"
+  },
+  {
+   "video": "train-00001-of-01357.parquet:23",
+   "file": "train-00001-of-01357.parquet",
+   "row": 23,
+   "part": "sequential"
+  },
+  {
+   "video": "train-00001-of-01357.parquet:30",
+   "file": "train-00001-of-01357.parquet",
+   "row": 30,
+   "part": "sequential"
+  }
+ ]
+}

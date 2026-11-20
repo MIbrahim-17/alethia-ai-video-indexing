@@ -52,6 +52,8 @@ These are requirements we can't change. They are listed so that any proposed dec
 | D-017 | Staged sampling `staged-1>3>all-VPN` in `run.py` | Accepted, **final** (approved by the user 2026-11-20) | 2026-11-20 |
 | D-018 | Untouched correctness holdout | Accepted | 2026-11-20 |
 | D-019 | Memory bounds and CUDA OOM recovery | Accepted | 2026-11-20 |
+| D-020 | Optimisation plan, acceptance rules and stopping rule | Accepted (speed threshold pending confirmation) | 2026-11-20 |
+| D-021 | Step 0: profile of the VPN FP32 pipeline | Accepted (measurement) | 2026-11-20 |
 
 ### D-001: Development and benchmark server
 - **Status:** Accepted · **Date:** 2026-11-20
@@ -540,6 +542,56 @@ These are requirements we can't change. They are listed so that any proposed dec
   - An oversized second costs every frame's inference. It never happens on real data: S-5 had 0 overflow seconds in 101 videos.
   - **Regression check (S-5):** the output on all 101 videos is byte-for-byte identical to S-3, the timing matches within 0.4%, and 17 of 17 fixtures pass in both modes.
   - The every-frame fallback path uses the same Detector, so it gets the same OOM fix.
+### D-020: Optimisation plan, acceptance rules and stopping rule
+- **Status:** Accepted (set by the user), except the ⚠ item · **Date:** 2026-11-20 · Frame sampling is frozen at `staged-1>3>all-VPN` (D-017) and is not part of this plan.
+- **Order of experiments** (the user's):
+
+  | # | Optimisation | Expected gain | Correctness risk |
+  |---|---|---|---|
+  | 0 | Detailed profiling | finds the bottlenecks | none |
+  | 1 | FP16 PyTorch inference | medium to high | numerical differences |
+  | 2 | Overlap decoding with inference | depends on decode time | concurrency bugs |
+  | 3 | PyAV decoder threading | low to medium, depends on workload | frame timing and order |
+  | 4 | TensorRT FP16 | potentially high | numerical and deployment differences |
+  | 5 | Batch-size tuning | incremental | low |
+  | 6 | Less preprocessing and copying | variable | medium |
+  | 7 | `torch.compile` / cuDNN benchmark | variable | — |
+- **Acceptance rules (every experiment):**
+  1. **Correctness:** all three grading thresholds pass with large margins. The target is **F1 ≥ 0.99, people exact ≥ 0.98, within ±1 ≥ 0.995**, on both the 101-video development set and the holdout (D-018). F1 is min(micro, macro), as in D-015 #4.
+  2. **Completeness:** no missing seconds, no duplicate results, and no unexplained differences in which frames are run.
+  3. **Robustness:** all 17 fixtures and all unit tests pass.
+  4. **Speed:** a repeatable end-to-end improvement on the same timing set and GPU (the 66 sequential videos on GPU 0, the S-1 setup).
+  5. **Memory:** no unbounded queue growth and no new high-resolution OOM failure (`validation/test_memory.py` passes).
+  6. **Deployment:** works in an offline run like the grader's.
+- **Stopping rule:** an optimisation is promoted only if it gives a meaningful measured speed-up, passes every correctness test, and runs reliably in the final environment. Otherwise it is recorded as rejected, and the current version stays.
+- **⚠ "Meaningful", as I proposed it (pending the user's confirmation):** at least **5% less wall time** on the 66-video timing set, **seen in 2 runs** of each version. The run-to-run noise measured so far is 0.4% (S-3 against S-5).
+- **Screening:** an experiment is first timed on the fixed 10-video profiling set (`validation/subset/profile_set.json`, every 7th sequential video, about 6 minutes per run). Only promising ones go on to the full timing set and the correctness runs.
+
+### D-021: Step 0: profile of the VPN FP32 pipeline
+- **Status:** Accepted (measurement) · **Date:** 2026-11-20 · `validation/profile_run.py`. GPU 0, the 10-video profiling set (116,255 frames decoded, 41,559 run, 1,420 predict calls, 29.3 frames per call).
+- **Where the wall time goes** (338.4 s in total; each stage timed where it happens, CUDA synchronised around predict):
+
+  | Stage | Time | Share |
+  |---|---|---|
+  | decode (PyAV, default SLICE threading) | 31.8 s | 9.4% |
+  | convert YUV → BGR (only frames run) | 26.3 s | 7.8% |
+  | predict: preprocess (letterbox, to GPU) | 10.6 s | 3.1% |
+  | **predict: model forward (FP32)** | **256.0 s** | **75.6%** |
+  | predict: postprocess (NMS, Results) | 9.0 s | 2.7% |
+  | predict: other call overhead | 0.4 s | 0.1% |
+  | other (sampling, aggregation, writing) | 4.3 s | 1.3% |
+
+  GPU use averaged 78%. Reading the Parquet rows took 0.5 s.
+- **Measured separately:**
+  - **Decode only, every frame:** default SLICE 3,912 fps; **FRAME 18,988 fps; AUTO 19,089 fps.** FineVideo's x264 streams have one slice, so the default decodes on a single thread.
+  - **Model forward only, FP32 at 640×384, images/s by batch size:** 1: 99.5; 4: 152; 8: 160; 16: 166; **32: 169**; 64: 171.
+- **Conclusions:**
+  1. **The FP32 forward pass is the bottleneck.** The pipeline runs about 162 images/s, against a ceiling of about 169 at batch 32. Changes that leave the forward pass alone can't do better than removing the remaining 24% of the time.
+  2. **FP16 (#1) and TensorRT (#4) are the main levers.** The CPU stages are the next limit after them.
+  3. **Overlap (#2):** up to about 24% of the time is CPU work that runs in turn with the GPU. Hiding all of it is worth at most about 1.3× at the current inference speed, and more once inference is faster.
+  4. **Decoder threading (#3):** decoding gets about 4.9× faster in isolation. That would save about 25 s of 338 s (about 7%), more once inference is faster.
+  5. **Batch size (#5):** 32 → 64 gains under 1% in FP32. Low priority.
+  6. **cuDNN benchmark** is off by default (`torch.backends.cudnn.benchmark = False`). It belongs to #7.
 ---
 
 ## Speed log
