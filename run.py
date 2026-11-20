@@ -384,8 +384,14 @@ def _unsure_vp(sec: _Second, flags: str) -> bool:
     return False
 
 
+INFER_LOG = None   # validation only (--log-inferred): one line per frame sent to the model
+_CUR_VIDEO = None
+
+
 def _run_positions(det, todo):
     """todo: list of (second, position). Runs the model on those frames in bounded batches."""
+    if INFER_LOG is not None:
+        INFER_LOG.write("".join(f"{_CUR_VIDEO} {sec.s} {p}\n" for sec, p in todo))
     i = 0
     while i < len(todo):
         batch, nbytes = [], 0
@@ -537,7 +543,12 @@ class StagedVideo:
         self.buffered_frames = sum(h[1] for h in held)
 
 
-def process_video_staged(video: str, mp4, det, w: Writer, keep_partial: bool, stages, flags) -> int:
+def process_video_staged(video: str, mp4, det, w: Writer, keep_partial: bool, stages, flags,
+                         frames=None) -> int:
+    """Staged sampling for one video. `frames`, if given, replaces iter_raw_frames(mp4) as the
+    frame source (the threaded pipeline, D-023); `mp4` is then only checked for emptiness."""
+    global _CUR_VIDEO
+    _CUR_VIDEO = video
     acc = SecondAccumulator(video, w)
     sv = StagedVideo(acc, det, stages, flags)
     n_frames = 0
@@ -545,7 +556,7 @@ def process_video_staged(video: str, mp4, det, w: Writer, keep_partial: bool, st
         if not mp4:
             raise VideoError("empty or missing mp4 bytes")
         decode_err = None
-        gen = iter_raw_frames(mp4)
+        gen = iter_raw_frames(mp4) if frames is None else frames
         while True:
             try:
                 t, vf, k = next(gen)
@@ -576,6 +587,292 @@ def process_video_staged(video: str, mp4, det, w: Writer, keep_partial: bool, st
     return n_frames
 
 
+# ---------------------------------------------------------------- threaded pipeline (D-023)
+
+QUEUE_BYTES = 512 << 20    # decoded frames waiting in the queue (YUV bytes)
+QUEUE_CHUNK_FRAMES = 32    # frames per queue item
+STATS["peak_queue_bytes"] = 0
+
+
+class _Stopped(Exception):
+    """The consumer has stopped; the decoder thread exits."""
+
+
+class _ByteQueue:
+    """FIFO limited by the bytes of the frames it holds. One item is always allowed in,
+    so a single large chunk can't block forever."""
+
+    def __init__(self, max_bytes: int):
+        import collections
+        import threading
+        self.max_bytes, self.bytes = max_bytes, 0
+        self.items = collections.deque()
+        self.cv = threading.Condition()
+        self.stopped = False
+
+    def put(self, item, nbytes: int = 0):
+        with self.cv:
+            while self.items and self.bytes + nbytes > self.max_bytes and not self.stopped:
+                self.cv.wait()
+            if self.stopped:
+                raise _Stopped
+            self.items.append((item, nbytes))
+            self.bytes += nbytes
+            STATS["peak_queue_bytes"] = max(STATS["peak_queue_bytes"], self.bytes)
+            self.cv.notify_all()
+
+    def get(self):
+        with self.cv:
+            while not self.items:
+                self.cv.wait()
+            item, nbytes = self.items.popleft()
+            self.bytes -= nbytes
+            self.cv.notify_all()
+            return item
+
+    def stop(self):
+        with self.cv:
+            self.stopped = True
+            self.items.clear()
+            self.bytes = 0
+            self.cv.notify_all()
+
+
+class FrameProducer:
+    """The decoder thread: reads Parquet rows in order and decodes each video with
+    iter_raw_frames, sending events to the queue in the same order as run_serial works:
+      ("file_problem", name, exc)            footer unreadable
+      ("rows_unreadable", name, row, n, exc) rows from `row` on can't be read
+      ("video", vid, has_bytes)              then, for a video with bytes, ("frames", list)
+                                             chunks and exactly one of ("vend",),
+                                             ("verr", VideoError) or ("vexc", exception)
+      ("done",) at the end, or ("fatal", exc) first if the thread itself failed.
+    """
+
+    def __init__(self, files, only):
+        import threading
+        self.files, self.only = files, only
+        self.q = _ByteQueue(QUEUE_BYTES)
+        self.thread = threading.Thread(target=self._run, name="decoder", daemon=True)
+
+    def start(self):
+        self.thread.start()
+
+    def stop(self):
+        self.q.stop()
+        self.thread.join(timeout=10)
+
+    def _run(self):
+        try:
+            self._produce()
+        except _Stopped:
+            return
+        except BaseException as e:  # noqa: BLE001
+            try:
+                self.q.put(("fatal", e))
+            except _Stopped:
+                return
+        try:
+            self.q.put(("done",))
+        except _Stopped:
+            pass
+
+    def _produce(self):
+        import pyarrow.parquet as pq
+
+        for path in self.files:
+            try:
+                pf = pq.ParquetFile(path)
+                n_rows = pf.metadata.num_rows
+            except Exception as e:  # noqa: BLE001
+                self.q.put(("file_problem", path.name, e))
+                continue
+            row = 0
+            try:
+                for batch in pf.iter_batches(batch_size=1, columns=["mp4"]):
+                    for mp4 in batch.column("mp4").to_pylist():
+                        vid = f"{path.name}:{row}"
+                        if self.only is None or vid in self.only:
+                            self._decode(vid, mp4)
+                        row += 1
+            except _Stopped:
+                raise
+            except Exception as e:  # noqa: BLE001 - reading failed: like run_serial
+                self.q.put(("rows_unreadable", path.name, row, n_rows, e))
+
+    def _decode(self, vid, mp4):
+        self.q.put(("video", vid, bool(mp4)))
+        if not mp4:
+            return
+        chunk, nbytes = [], 0
+        try:
+            for item in iter_raw_frames(mp4):
+                chunk.append(item)
+                nbytes += frame_bytes(item[1])
+                del item
+                if len(chunk) >= QUEUE_CHUNK_FRAMES:
+                    self.q.put(("frames", chunk), nbytes)
+                    chunk, nbytes = [], 0
+        except VideoError as e:
+            end = ("verr", e)
+        except _Stopped:
+            raise
+        except Exception as e:  # noqa: BLE001
+            end = ("vexc", e)
+        else:
+            end = ("vend",)
+        if chunk:
+            self.q.put(("frames", chunk), nbytes)
+        self.q.put(end)
+
+
+class _QueuedFrames:
+    """Iterator over one video's frames from the queue; raises the decoder's error after the
+    frames decoded before it, like iter_raw_frames. Frames are handed over one at a time and
+    not kept, so their release is decided only by process_video_staged (D-019)."""
+
+    def __init__(self, q: _ByteQueue):
+        import collections
+        self.q, self.ended = q, False
+        self.terminal = None  # ("done",) or ("fatal", exc) if the stream ended inside this video
+        self.items = collections.deque()
+
+    def __iter__(self):
+        return self
+
+    def _next_event(self):
+        ev = self.q.get()
+        if ev[0] in ("fatal", "done"):  # can only happen if the decoder thread failed
+            self.ended, self.terminal = True, ev
+            raise RuntimeError("decoder thread failed") from (ev[1] if ev[0] == "fatal" else None)
+        return ev
+
+    def __next__(self):
+        while not self.items:
+            if self.ended:
+                raise StopIteration
+            ev = self._next_event()
+            if ev[0] == "frames":
+                self.items.extend(ev[1])
+                ev[1].clear()
+            elif ev[0] == "vend":
+                self.ended = True
+            else:  # "verr" or "vexc"
+                self.ended = True
+                raise ev[1]
+            del ev
+        return self.items.popleft()
+
+    def close(self):
+        """Skip whatever is left of this video (after an early stop, e.g. a timestamp going back)."""
+        self.items.clear()
+        while not self.ended:
+            try:
+                ev = self._next_event()
+            except RuntimeError:
+                return
+            if ev[0] in ("vend", "verr", "vexc"):
+                self.ended = True
+            elif ev[0] == "frames":
+                ev[1].clear()
+
+
+def _log_video(vid, nf, inferred, t_v):
+    print(f"{vid} frames={nf} inferred={inferred} {time.time() - t_v:.1f}s", file=sys.stderr, flush=True)
+
+
+def _file_problem(msg, file_problems):
+    print(f"WARNING {msg}", file=sys.stderr)
+    file_problems.append(msg)
+
+
+def run_serial(files, only, det, w, keep_partial, sampling) -> tuple[int, int, list]:
+    """The single-threaded loop (D-015, D-017): read, decode and infer in turn. The fallback."""
+    import pyarrow.parquet as pq
+
+    n_videos = n_frames = 0
+    file_problems = []
+    for path in files:
+        try:
+            pf = pq.ParquetFile(path)
+            n_rows = pf.metadata.num_rows
+        except Exception as e:  # noqa: BLE001 - footer unreadable: no valid video IDs (D-015 #2)
+            _file_problem(f"{path.name}: unreadable Parquet file ({type(e).__name__}: {e})", file_problems)
+            continue
+        row = 0
+        try:
+            for batch in pf.iter_batches(batch_size=1, columns=["mp4"]):
+                for mp4 in batch.column("mp4").to_pylist():
+                    vid = f"{path.name}:{row}"
+                    if only is not None and vid not in only:
+                        row += 1
+                        continue
+                    t_v, inf0 = time.time(), det.n_frames
+                    if SAMPLING[sampling] is None:
+                        nf = process_video(vid, mp4, det, w, keep_partial)
+                    else:
+                        stages, flags = SAMPLING[sampling]
+                        nf = process_video_staged(vid, mp4, det, w, keep_partial, stages, flags)
+                    n_videos += 1
+                    n_frames += nf
+                    _log_video(vid, nf, det.n_frames - inf0, t_v)
+                    row += 1
+        except Exception as e:  # noqa: BLE001 - data unreadable: an error line for each remaining row
+            for r in range(row, n_rows):
+                w.error(f"{path.name}:{r}", f"could not read row: {type(e).__name__}")
+            w.flush()
+            _file_problem(f"{path.name}: rows {row}..{n_rows - 1} unreadable ({type(e).__name__}: {e})",
+                          file_problems)
+    return n_videos, n_frames, file_problems
+
+
+def run_threaded(files, only, det, w, keep_partial, sampling) -> tuple[int, int, list]:
+    """Decoding in a separate thread, overlapped with inference (D-023). The main thread does
+    exactly what run_serial does, in the same order, on the same frames."""
+    stages, flags = SAMPLING[sampling]
+    prod = FrameProducer(files, only)
+    prod.start()
+    n_videos = n_frames = 0
+    file_problems = []
+    try:
+        while True:
+            ev = prod.q.get()
+            kind = ev[0]
+            if kind == "done":
+                break
+            if kind == "fatal":
+                raise RuntimeError("decoder thread failed") from ev[1]
+            if kind == "file_problem":
+                _, name, e = ev
+                _file_problem(f"{name}: unreadable Parquet file ({type(e).__name__}: {e})", file_problems)
+            elif kind == "rows_unreadable":
+                _, name, row, n_rows, e = ev
+                for r in range(row, n_rows):
+                    w.error(f"{name}:{r}", f"could not read row: {type(e).__name__}")
+                w.flush()
+                _file_problem(f"{name}: rows {row}..{n_rows - 1} unreadable ({type(e).__name__}: {e})",
+                              file_problems)
+            elif kind == "video":
+                _, vid, has_bytes = ev
+                t_v, inf0 = time.time(), det.n_frames
+                frames = _QueuedFrames(prod.q) if has_bytes else None
+                nf = process_video_staged(vid, has_bytes, det, w, keep_partial, stages, flags,
+                                          frames=frames)
+                if frames is not None:
+                    frames.close()
+                    if frames.terminal is not None:  # the decoder thread failed inside this video
+                        if frames.terminal[0] == "fatal":
+                            raise RuntimeError("decoder thread failed") from frames.terminal[1]
+                        break
+                n_videos += 1
+                n_frames += nf
+                _log_video(vid, nf, det.n_frames - inf0, t_v)
+            del ev
+    finally:
+        prod.stop()
+    return n_videos, n_frames, file_problems
+
+
 # ---------------------------------------------------------------- main
 
 def main():
@@ -589,8 +886,15 @@ def main():
                     help="which frames go through the model (D-017); 'all' is the every-frame fallback")
     ap.add_argument("--precision", choices=["fp32", "fp16"], default="fp16",
                     help="model precision; fp16 was promoted in D-022, fp32 is the fallback")
+    ap.add_argument("--pipeline", choices=["serial", "threaded"], default="threaded",
+                    help="threaded (default, D-023): decode in a separate thread, overlapped with "
+                         "inference; serial: the single-threaded fallback")
     ap.add_argument("--only-videos", help=argparse.SUPPRESS)  # dev only: subset manifest JSON
+    ap.add_argument("--log-inferred", help=argparse.SUPPRESS)  # dev only: frames sent to the model
     a = ap.parse_args()
+    global INFER_LOG
+    if a.log_inferred:
+        INFER_LOG = open(a.log_inferred, "w", buffering=1 << 20)
 
     only = None
     if a.only_videos:  # validation use only: keep row numbers as they are and skip other rows
@@ -601,50 +905,16 @@ def main():
     det = Detector(Path(a.weights), half=a.precision == "fp16")
     w = Writer(a.output)
     keep_partial = not a.drop_partial_second
-    n_videos = n_frames = 0
-    file_problems = []
-
-    import pyarrow.parquet as pq
-
-    for path in files:
-        try:
-            pf = pq.ParquetFile(path)
-            n_rows = pf.metadata.num_rows
-        except Exception as e:  # noqa: BLE001 - footer unreadable: no valid video IDs (D-015 #2)
-            msg = f"{path.name}: unreadable Parquet file ({type(e).__name__}: {e})"
-            print(f"WARNING {msg}", file=sys.stderr)
-            file_problems.append(msg)
-            continue
-        row = 0
-        try:
-            for batch in pf.iter_batches(batch_size=1, columns=["mp4"]):
-                for mp4 in batch.column("mp4").to_pylist():
-                    vid = f"{path.name}:{row}"
-                    if only is not None and vid not in only:
-                        row += 1
-                        continue
-                    t_v, inf0 = time.time(), det.n_frames
-                    if SAMPLING[a.sampling] is None:
-                        nf = process_video(vid, mp4, det, w, keep_partial)
-                    else:
-                        stages, flags = SAMPLING[a.sampling]
-                        nf = process_video_staged(vid, mp4, det, w, keep_partial, stages, flags)
-                    n_videos += 1
-                    n_frames += nf
-                    print(f"{vid} frames={nf} inferred={det.n_frames - inf0} {time.time() - t_v:.1f}s",
-                          file=sys.stderr, flush=True)
-                    row += 1
-        except Exception as e:  # noqa: BLE001 - data unreadable: an error line for each remaining row
-            for r in range(row, n_rows):
-                w.error(f"{path.name}:{r}", f"could not read row: {type(e).__name__}")
-            w.flush()
-            msg = f"{path.name}: rows {row}..{n_rows - 1} unreadable ({type(e).__name__}: {e})"
-            print(f"WARNING {msg}", file=sys.stderr)
-            file_problems.append(msg)
+    pipeline = a.pipeline if SAMPLING[a.sampling] is not None else "serial"  # 'all' is serial only
+    runner = run_threaded if pipeline == "threaded" else run_serial
+    n_videos, n_frames, file_problems = runner(files, only, det, w, keep_partial, a.sampling)
 
     w.close()
+    if INFER_LOG is not None:
+        INFER_LOG.close()
     dt = time.time() - t_start
-    print(f"DONE sampling={a.sampling} precision={a.precision} files={len(files)} videos={n_videos} frames={n_frames} "
+    print(f"DONE sampling={a.sampling} precision={a.precision} pipeline={pipeline} "
+          f"peak_queue_mb={STATS['peak_queue_bytes'] / 2**20:.0f} files={len(files)} videos={n_videos} frames={n_frames} "
           f"inferred={det.n_frames} predict_calls={det.n_calls} oom_retries={det.n_oom} "
           f"peak_buffered_frames={STATS['peak_buffered_frames']} "
           f"peak_buffered_mb={STATS['peak_buffered_bytes'] / 2**20:.0f} "

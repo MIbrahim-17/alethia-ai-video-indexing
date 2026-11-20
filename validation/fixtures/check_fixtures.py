@@ -73,6 +73,7 @@ def main():
                     "simulator's selection rule (validation/simulate_sampling.py) for staged strategies")
     ap.add_argument("--precision", choices=["fp32", "fp16"], default="fp32",
                     help="run.py --precision; the oracle's single-frame predict uses the same precision")
+    ap.add_argument("--pipeline", choices=["serial", "threaded"], default="serial")
     a = ap.parse_args()
     q = {"quantize": 16} if a.precision == "fp16" else {}
     stage_rule = None
@@ -82,12 +83,12 @@ def main():
 
     fdir = Path(a.fixtures)
     manifest = json.loads((fdir / "manifest.json").read_text())
-    tag = a.sampling.replace(">", "_") + ("" if a.precision == "fp32" else "_fp16")
+    tag = a.sampling.replace(">", "_") + ("" if a.precision == "fp32" else "_fp16") + "_" + a.pipeline
     out_path = fdir / f"run_output_{tag}.jsonl"
     if not a.skip_run:
         r = subprocess.run([sys.executable, str(ROOT / "run.py"), "--input", str(fdir / "input"),
                             "--output", str(out_path), "--sampling", a.sampling,
-                            "--precision", a.precision],
+                            "--precision", a.precision, "--pipeline", a.pipeline],
                            capture_output=True, text=True)
         (fdir / f"run_stderr_{tag}.log").write_text(r.stderr)
         if r.returncode != 0:

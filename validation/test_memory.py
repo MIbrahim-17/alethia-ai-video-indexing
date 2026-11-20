@@ -40,6 +40,7 @@ sys.path.insert(0, str(ROOT / "validation" / "fixtures"))
 import run  # noqa: E402
 
 PRECISION = "fp32"
+PIPELINE = "serial"
 FAST = {"crf": "28", "preset": "ultrafast", "g": "30", "bf": "0"}
 
 
@@ -80,7 +81,8 @@ def rss_kb(pid):
 
 def part_a(work: Path, order):
     p = subprocess.Popen([sys.executable, str(ROOT / "run.py"), "--input", str(work / "input"),
-                          "--output", str(work / "out.jsonl"), "--precision", PRECISION], stderr=subprocess.PIPE, text=True,
+                          "--output", str(work / "out.jsonl"), "--precision", PRECISION,
+                          "--pipeline", PIPELINE], stderr=subprocess.PIPE, text=True,
                          env={**__import__("os").environ, "CUDA_VISIBLE_DEVICES": "0"})
     samples, stop = [], False
 
@@ -174,6 +176,52 @@ def part_b(work: Path, det):
         print(f"  B: {name}: {n} frames decoded, written seconds with live frames: "
               f"{sorted(set(violations))[:5]}, frames alive after the video: {left} -> "
               f"{'PASS' if good else 'FAIL'}")
+    return ok
+
+
+def part_b_threaded(work: Path, det):
+    """Part B through run_threaded: the decoder thread makes the proxies, the main thread
+    releases them. Checked per video after every process() call."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    mp4s = pq.read_table(work / "input" / "memtest.parquet").column("mp4").to_pylist()[:2]
+    bdir = work / "input_b"
+    bdir.mkdir(exist_ok=True)
+    pq.write_table(pa.table({"mp4": pa.array(mp4s, pa.binary())}), bdir / "memtest_b.parquet")
+    orig_iter, orig_proc = run.iter_raw_frames, run.StagedVideo.process
+    refs = []          # per video, in decode order: second -> weak references
+    violations = []
+
+    def wrapped(m):
+        mine = {}
+        refs.append(mine)
+        for t, f, k in orig_iter(m):
+            px = Proxy(f)
+            mine.setdefault(int(t // 1), []).append(weakref.ref(px))
+            yield t, px, k
+
+    def tracked(self, final):
+        orig_proc(self, final)
+        k = int(self.acc.video.rsplit(":", 1)[1])
+        alive_from = min([x.s for x in self.pending] + ([self.cur.s] if self.cur else []) + [10**9])
+        violations.extend((k, s) for s, rs in refs[k].items()
+                          if s < alive_from and any(r() is not None for r in rs))
+
+    run.iter_raw_frames, run.StagedVideo.process = wrapped, tracked
+    w = run.Writer(str(work / "b_threaded.jsonl"))
+    try:
+        run.run_threaded([bdir / "memtest_b.parquet"], None, det, w, True, "staged-1>3>all-VPN")
+    finally:
+        run.iter_raw_frames, run.StagedVideo.process = orig_iter, orig_proc
+        w.close()
+    gc.collect()
+    left = sum(r() is not None for mine in refs for rs in mine.values() for r in rs)
+    n = sum(len(rs) for mine in refs for rs in mine.values())
+    ok = not violations and left == 0 and len(refs) == 2
+    print(f"  B (threaded): {len(refs)} videos, {n} frames decoded in the decoder thread; written "
+          f"seconds with live frames: {sorted(set(violations))[:5]}; frames alive afterwards: {left} -> "
+          f"{'PASS' if ok else 'FAIL'}")
     return ok
 
 
@@ -273,9 +321,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--work", default="work/memtest")
     ap.add_argument("--precision", choices=["fp32", "fp16"], default="fp32")
+    ap.add_argument("--pipeline", choices=["serial", "threaded"], default="serial")
     a = ap.parse_args()
-    global PRECISION
-    PRECISION = a.precision
+    global PRECISION, PIPELINE
+    PRECISION, PIPELINE = a.precision, a.pipeline
     work = Path(a.work)
     work.mkdir(parents=True, exist_ok=True)
     t = time.time()
@@ -283,7 +332,7 @@ def main():
     print(f"made {len(order)} synthetic videos in {time.time() - t:.0f}s")
     ok_a = part_a(work, order)
     det = run.Detector(ROOT / "weights" / "yolo11l.pt", half=a.precision == "fp16")
-    ok_b = part_b(work, det)
+    ok_b = part_b_threaded(work, det) if a.pipeline == "threaded" else part_b(work, det)
     ok_c = part_c(work, det)
     print(f"== A {'PASS' if ok_a else 'FAIL'}, B {'PASS' if ok_b else 'FAIL'}, C {'PASS' if ok_c else 'FAIL'}")
     sys.exit(0 if ok_a and ok_b and ok_c else 1)

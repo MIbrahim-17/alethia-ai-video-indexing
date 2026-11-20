@@ -52,9 +52,10 @@ These are requirements we can't change. They are listed so that any proposed dec
 | D-017 | Staged sampling `staged-1>3>all-VPN` in `run.py` | Accepted, **final** (approved by the user 2026-11-20) | 2026-11-20 |
 | D-018 | Untouched correctness holdout | Accepted | 2026-11-20 |
 | D-019 | Memory bounds and CUDA OOM recovery | Accepted | 2026-11-20 |
-| D-020 | Optimisation plan, acceptance rules and stopping rule | Accepted (5% speed threshold pending confirmation) | 2026-11-20 |
+| D-020 | Optimisation plan, acceptance rules and stopping rule | Accepted (5% speed threshold approved 2026-11-20) | 2026-11-20 |
 | D-021 | Step 0: profile of the VPN FP32 pipeline | Accepted (measurement) | 2026-11-20 |
 | D-022 | Experiment 1: FP16 PyTorch inference | **Promoted** (default `--precision fp16`) | 2026-11-20 |
+| D-023 | Experiment 2: overlap decoding with inference | **Promoted** (default `--pipeline threaded`) | 2026-11-20 |
 
 ### D-001: Development and benchmark server
 - **Status:** Accepted · **Date:** 2026-11-20
@@ -566,6 +567,7 @@ These are requirements we can't change. They are listed so that any proposed dec
   6. **Deployment:** works in an offline run like the grader's.
 - **Stopping rule:** an optimisation is promoted only if it gives a meaningful measured speed-up, passes every correctness test, and runs reliably in the final environment. Otherwise it is recorded as rejected, and the current version stays.
 - **⚠ "Meaningful", as I proposed it (pending the user's confirmation):** at least **5% less wall time** on the 66-video timing set, **seen in 2 runs** of each version. The run-to-run noise measured so far is 0.4% (S-3 against S-5).
+- **Update 2026-11-20: the threshold is approved by the user.** The minimum for adopting a performance optimisation is **at least 5% less end-to-end wall time, reproduced in two comparable runs** (same timing set, same GPU, nothing else running).
 - **Screening:** an experiment is first timed on the fixed 10-video profiling set (`validation/subset/profile_set.json`, every 7th sequential video, about 6 minutes per run). Only promising ones go on to the full timing set and the correctness runs.
 
 ### D-021: Step 0: profile of the VPN FP32 pipeline
@@ -637,6 +639,65 @@ These are requirements we can't change. They are listed so that any proposed dec
 - **Consequences:**
   - Peak RSS rose from 5.4 to 7.2 GB, from CUDA/cuBLAS FP16 workspaces; it's bounded and well inside 64 GB.
   - The CPU stages (decode 14%, convert 12%, pre/post-processing 9%) are now the next bottleneck, so overlapping (#2) and decoder threading (#3) gain in value.
+### D-023: Experiment 2: overlap decoding with inference
+- **Status:** **Promoted**: it meets every rule below. `run.py` now defaults to `--pipeline threaded`, and `--pipeline serial` is the fallback. · **Date:** 2026-11-20
+- **Acceptance rules for this experiment** (set by the user; stricter than for FP16 because this is a concurrency-only change):
+  1. **Performance:** both runs are at least 5% faster than the FP16 control under comparable conditions, including warm-up and machine load. The control is re-run interleaved with the candidate: control, candidate, control, candidate.
+  2. **Correctness:** exactly the same frames sent to the model, and preferably byte-identical JSONL, against the frozen FP16 implementation (D-022).
+  3. **Completeness:** no dropped, duplicated or reordered frames that affect which second a frame belongs to.
+  4. **Robustness:** all 17 fixtures and the existing unit tests pass, including interrupted decoding.
+  5. **Memory:** RAM and VRAM stay bounded, with no persistent growth from video to video.
+  6. **Complexity:** the implementation stays maintainable, and a sequential fallback is kept.
+  - **No intended change** in numerical calculations, frame selection or model inputs.
+- **Design:**
+  - A single decoder thread reads the Parquet rows and runs `iter_raw_frames` (the same code). It passes decoded frames in order, in chunks of up to 32 frames, through a queue limited by bytes, together with per-video start, end and error events.
+  - The main thread consumes them through the unchanged `process_video_staged` logic: the same sampling, batching, inference, aggregation and writing, and the only writer.
+  - PyAV releases the GIL while demuxing and decoding, so decoding runs while the GPU works.
+  - `--pipeline serial` keeps the previous single-threaded loop as the fallback.
+- **Implementation (`run.py`, about 200 lines):**
+  - `FrameProducer` (the decoder thread), `_ByteQueue` (512 MB, by YUV bytes, 32-frame chunks), `_QueuedFrames` (one video's frames for `process_video_staged`, which now takes an optional `frames=` source), and `run_threaded`.
+  - `run_serial` is the previous loop, moved into a function unchanged.
+  - Each video's events come in order: `video`, then frame chunks, then exactly one of end, VideoError or unexpected exception. File-level problems are passed through as events, and the main thread writes exactly the same error lines and warnings as `run_serial`.
+  - If processing stops early (for example a timestamp going back), the rest of that video's events are skipped.
+  - A crash of the decoder thread itself ends the run with an error instead of hanging.
+  - `--sampling all` always runs serially.
+  - Validation only: a hidden `--log-inferred` option writes every frame sent to the model as (video, second, position in second).
+- **Results (2026-11-20; GPU 0 alone; FP16; VPN):**
+  1. **Performance:** the 66-video timing set, run interleaved:
+
+     | Run | Pipeline | Wall time |
+     |---|---|---|
+     | control 1 | serial | 657.5 s |
+     | candidate 1 | threaded | **533.8 s** |
+     | control 2 | serial | 659.2 s |
+     | candidate 2 | threaded | **534.2 s** |
+
+     - Both threaded runs are **18.7–19.0% faster** than both controls, and the controls match S-6 (658.3 / 658.4 s).
+     - Diverse: 360.6 → 299.0 s (−17.1%). Holdout: 525.7 → 427.6 s (−18.7%).
+     - Screening on the profiling set: 224.4 → 193.7 s (−13.7%).
+     - CPU use 108% → 134%: decoding now runs alongside inference.
+  2. **Correctness:**
+     - **All 8 outputs are byte-for-byte identical to the frozen FP16 implementation (S-6)**: 4 on the timing set, plus serial and threaded on diverse and on the holdout.
+     - **The inferred frame IDs are identical, in the same order**, between serial and threaded: 126,169 frames on the timing set (all 4 runs), 65,693 on diverse, 95,867 on the holdout.
+  3. **Completeness:** follows from 2. Nothing is dropped, duplicated or reordered, and there are no missing or extra lines.
+  4. **Robustness:**
+     - **Unit tests:** 23 of 23 pass. The 2 new ones:
+       - threaded equals serial exactly (output, frames and order sent to the model, counts and file problems) across good videos, empty and missing bytes, decode failure partway, a timestamp going back, an unexpected decoder exception and an unreadable Parquet file. This holds with the normal queue and with 1-byte queues of 3-frame and 1-frame chunks, which force constant waiting.
+       - A decoder-thread crash raises an error within the time limit instead of hanging.
+     - **Fixtures:** 17 of 17 pass with `--sampling staged-1>3>all-VPN --pipeline threaded` (confirmed `pipeline=threaded` in the log), including the truncated and corrupted videos. The output is byte-identical to the serial fixture run.
+       - Note: the checker's default `--sampling all` runs serially, so the first "threaded" fixture run didn't actually test threading. It was re-run with staged sampling.
+  5. **Memory:** `test_memory.py --precision fp16 --pipeline threaded` passes A, B and C.
+     - A: peak RSS per video levels off at 4.8 GB (the last 4 within 0.04 GB); queue peak 475 MB of 512.
+     - B (threaded): frames created in the decoder thread are released once their seconds are written.
+     - C: OOM recovery unchanged.
+     - On the timing set, peak RSS went from 7.16 to 7.93–8.07 GB (holdout 8.58 GB): the queue's 512 MB plus PyAV buffers. It's bounded.
+     - VRAM is unchanged, because the same batches go to the same model.
+  6. **Complexity:** one decoder thread, one bounded queue and no locks shared with the model code. The serial loop is kept unchanged as the fallback.
+- **Deployment:** standard library threading only. No new dependencies.
+- **Alternatives considered:**
+  - Converting frames to BGR in the decoder thread: frame selection depends on the model's results, so it can't be known in advance, except for the stage-1 middle frames, which are about 14% of the frames run.
+  - A decoder process instead of a thread: PyAV releases the GIL while decoding, so a thread is enough and avoids copying frames between processes.
+- **What's left on the CPU** (from D-021/D-022): converting YUV to BGR (about 12%) and pre/post-processing (about 9%) still run in the main thread between GPU batches.
 ---
 
 ## Speed log
@@ -652,6 +713,7 @@ Every timed run, in order, so each optimisation can be compared with the one bef
 | S-4 | 2026-11-20 | `staged-1>3>all-VPN` (D-017) | holdout (D-018) | 0 (RTX 6000), alone | 48 / 403,553 / 3.98 h | 827 s (13.8 min) | 487.7 | 0.0577 | ≈7.2 h | ≈0.75 h | holdout: F1 gate 0.9947, exact 0.9950, within ±1 0.9999 | 96,149 frames run (23.8%), 3,445 predict calls, peak RSS 5.58 GB. Agrees with S-3 (0.0559 s per video-s). |
 | S-5 | 2026-11-20 | `staged-1>3>all-VPN` with the D-019 memory changes | sequential subset | 0 (RTX 6000), alone | 66 / 526,328 / 5.21 h | 1,054 s (17.6 min) | 499.5 | 0.0562 | ≈7.0 h | ≈0.73 h | output **byte-for-byte identical to S-3** on all 101 videos; equal to the simulator | Same as S-3 within 0.4%. 126,201 frames run, 4,494 predict calls, 0 OOM retries, peak buffer 990 frames / 326 MB (diverse part: 500 MB), 0 overflow seconds, peak RSS 5.42 GB. |
 | S-6 | 2026-11-20 | VPN + **FP16** (D-022) | sequential subset, 2 runs | 0 (RTX 6000), alone | 66 / 526,328 / 5.21 h | **658.3 s / 658.4 s (11.0 min)** | 799.5 | 0.0351 | ≈4.4 h | ≈0.46 h (27 min) | dev: F1 0.9938, exact 0.9928, within ±1 0.9999; holdout: 0.9947 / 0.9939 / 0.9999 | 126,169 frames run, 4,495 predict calls, 0 OOM retries, peak RSS 7.18 GB. The two runs are byte-for-byte identical. **1.60× faster than S-3/S-5; 5.8× faster than S-1.** Diverse: 360.8 s; holdout: 526.0 s (0.0367 s per video-s). |
+| S-7 | 2026-11-20 | VPN + FP16 + **threaded decoding** (D-023) | sequential subset, 2 runs interleaved with 2 serial controls (657.5 / 659.2 s) | 0 (RTX 6000), alone | 66 / 526,328 / 5.21 h | **533.8 s / 534.2 s (8.9 min)** | 985.6 | 0.0285 | ≈3.6 h | ≈0.37 h (22 min) | byte-identical to S-6 on dev and holdout; same inferred frame IDs | −18.9% against the serial controls. CPU 134%, peak RSS 7.9–8.1 GB, queue peak 512 MB. Diverse 299.0 s, holdout 427.6 s. **7.2× faster than S-1.** |
 
 <!--
 Template for new entries (copy below this line):

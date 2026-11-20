@@ -358,6 +358,106 @@ def test_oversized_second_is_streamed_not_buffered():
     assert [g for g in got if g[0] != 1] == [x for x in want if x[0] != 1]
 
 
+# ---------------------------------------------------------------- threaded pipeline (D-023)
+
+class _Boom(BaseException):
+    """Not an Exception: escapes every per-video handler, like a crash in the decoder thread."""
+
+
+def _pipeline_inputs(tmp):
+    """Two Parquet files plus an unreadable one. Each mp4 value is a key into SPECS."""
+    import numpy as np
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    rng = np.random.default_rng(5)
+    specs = {}
+    rows = []
+    for i in range(14):
+        key = f"v{i}".encode()
+        spec = _random_video(rng, int(rng.integers(1, 70)))
+        mode = {3: "fail", 6: "back", 9: "exc"}.get(i)
+        specs[key] = (spec, mode)
+        rows.append(key)
+    rows[4], rows[11] = b"", None  # empty and missing bytes
+    for name, part in (("a.parquet", rows[:7]), ("b.parquet", rows[7:])):
+        pq.write_table(pa.table({"mp4": pa.array(part, pa.binary())}), tmp / name)
+    (tmp / "c.parquet").write_bytes(b"not a parquet file")
+    return specs
+
+
+def _run_pipeline(kind, tmp, specs, crash_key=None):
+    w, det = FakeWriter(), CountingDetector()
+    orig = run.iter_raw_frames, run.frame_to_bgr
+
+    def gen(mp4):
+        spec, mode = specs[mp4]
+        if mp4 == crash_key:
+            raise _Boom()
+        for i, (t, boxes) in enumerate(spec):
+            if mode == "fail" and i == len(spec) // 2:
+                raise run.VideoError("decode failed: simulated")
+            if mode == "exc" and i == len(spec) // 2:
+                raise RuntimeError("simulated decoder bug")
+            if mode == "back" and i == len(spec) // 2:
+                yield Fraction(0), _RawImg(boxes, (mp4, i)), 0
+                continue
+            yield Fraction(t), _RawImg(boxes, (mp4, i)), 0
+
+    run.iter_raw_frames, run.frame_to_bgr = gen, (lambda vf, k: vf)
+    try:
+        files = sorted(tmp.glob("*.parquet"))
+        runner = run.run_threaded if kind == "threaded" else run.run_serial
+        res = runner(files, None, det, w, True, "staged-1>3>all-VPN")
+    finally:
+        run.iter_raw_frames, run.frame_to_bgr = orig
+    return w.lines(), det.seen, res
+
+
+def test_threaded_equals_serial_exactly():
+    import tempfile
+    from pathlib import Path as P_
+    saved = run.QUEUE_BYTES, run.QUEUE_CHUNK_FRAMES
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            tmp = P_(d)
+            specs = _pipeline_inputs(tmp)
+            s_lines, s_seen, s_res = _run_pipeline("serial", tmp, specs)
+            for qb, chunk in ((512 << 20, 32), (1, 3), (1, 1)):  # normal, and a tiny queue (back-pressure)
+                run.QUEUE_BYTES, run.QUEUE_CHUNK_FRAMES = qb, chunk
+                t_lines, t_seen, t_res = _run_pipeline("threaded", tmp, specs)
+                assert t_lines == s_lines, f"queue {qb}/{chunk}: output differs"
+                assert t_seen == s_seen, f"queue {qb}/{chunk}: different frames or order sent to the model"
+                assert t_res == s_res, (t_res, s_res)
+            errs_ = [r for r in s_lines if "error" in r]
+            assert len(errs_) == 5, errs_  # fail, back, exc, empty, missing
+            assert len(s_res[2]) == 1  # c.parquet unreadable
+    finally:
+        run.QUEUE_BYTES, run.QUEUE_CHUNK_FRAMES = saved
+
+
+def test_threaded_decoder_crash_does_not_hang():
+    import tempfile
+    import threading
+    from pathlib import Path as P_
+    with tempfile.TemporaryDirectory() as d:
+        tmp = P_(d)
+        specs = _pipeline_inputs(tmp)
+        out = {}
+
+        def target():
+            try:
+                _run_pipeline("threaded", tmp, specs, crash_key=b"v5")
+                out["r"] = "returned"
+            except RuntimeError as e:
+                out["r"] = f"raised {e}"
+
+        th = threading.Thread(target=target, daemon=True)
+        th.start()
+        th.join(timeout=30)
+        assert not th.is_alive(), "threaded pipeline hung after a decoder-thread crash"
+        assert out["r"].startswith("raised decoder thread failed"), out
+
+
 def test_uniform_positions_match_simulator_float_rule():
     for n in range(0, 400):
         for k in (1, 3, 5, 9, 15):
