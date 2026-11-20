@@ -48,6 +48,7 @@ These are requirements we can't change. They are listed so that any proposed dec
 | D-013 | Synthetic fixture suite for unusual and damaged videos | Accepted | 2026-11-20 |
 | D-014 | Every-frame reference builder design | Accepted (3 items pending confirmation) | 2026-11-20 |
 | D-015 | Baseline `run.py` and scorer design | Accepted (baseline v1 measured 2026-11-20) | 2026-11-20 |
+| D-016 | Frame sampling: techniques tested and results | Experiment done, strategy not chosen | 2026-11-20 |
 
 ### D-001: Development and benchmark server
 - **Status:** Accepted · **Date:** 2026-11-20
@@ -365,6 +366,64 @@ These are requirements we can't change. They are listed so that any proposed dec
   - **Time-base check:** all 767,265 reference frames have `frame.time_base == stream.time_base`, so the reference stays valid with C4.
   - **Where the time goes:** decoding alone is cheap. Decoding all 767k frames took about 67 CPU-seconds in total (about 11,000 fps per core, without converting to arrays). So the baseline is limited by inference and its single-threaded preprocessing (GPU at about 90%, one CPU core).
 - **Noted for optimisation later, not part of the baseline:** shrinking frames early, but only with exactly the same resize Ultralytics uses (the same size, `cv2.resize` INTER_LINEAR). It must pass validation layer 2 first.
+
+### D-016: Frame sampling: techniques tested and results
+- **Status:** Experiment done; **strategy not chosen yet** (awaiting the user) · **Date:** 2026-11-20 · Follows D-003 step 3.
+- **Priority (set by the user):** accuracy and correctness first, speed second.
+- **Method:** `validation/simulate_sampling.py`.
+  - The reference stores every frame's detections (D-014), and batched and single-frame inference agree. So any sampling strategy's output can be computed exactly from those stored detections: select the frames, aggregate them with the brief §5 rules, and score against the every-frame reference. No GPU is needed (about 30 s for 50 strategies).
+  - **Self-check:** the simulator's every-frame aggregation reproduces `reference.jsonl` exactly on all 27,388 seconds.
+  - **Cost** = the share of frames that go through the model. Decoding still covers every frame, but it's cheap (D-015).
+  - **Metrics:** pooled over all seconds of all 101 videos. Robustness (layer 5): the 5th percentile of a 2,000-sample bootstrap over videos (p05), the sequential and diverse parts separately, and the worst single video.
+  - The simulator scores with its own code. The chosen strategy will also be run for real through `run.py` and scored with `score.py`.
+- **Techniques tested** (n = frames in the second, in time order; k = frames sampled per second):
+
+  | Name | Exact rule |
+  |---|---|
+  | `uniform-k` | k frames at index positions `floor((j + 0.5) · n / k)`, j = 0…k−1, in each second. All frames if n ≤ k. |
+  | `time-k` | the frame nearest each time `s + (j + 0.5) / k`. The same as `uniform-k` for constant frame rate; included to check variable frame rate. |
+  | `stride-N` | every Nth frame of the video (global frame index mod N = 0). A second that gets no frame uses its middle frame. |
+  | `adapt-k-F` | `uniform-k`; if the second is uncertain by any criterion in F, run the model on **all** its frames. |
+  | `staged-k1>k2>…-F` | `uniform-k1`; while the second is still uncertain, add the `uniform-k2` frames, then `k3`, … (`all` = every frame). The result uses every frame run so far. With k2 = 3·k1 the positions nest (1 → 3 → 9), so no inferred frame is wasted. |
+
+  Uncertainty criteria:
+  - **V:** the sampled frames disagree on whether some object is present.
+  - **P:** the sampled frames disagree on the person count.
+  - **C:** some sampled detection has confidence below 0.5 (0.45, 0.6 and 0.7 were also tried).
+  - **N:** the second's first-stage result (objects and people) differs from the previous or next second's first-stage result. It needs one second of look-ahead and is checked at the first stage only.
+- **Results** (selected rows; all rows are in `work/sampling/sim*.json` on the server). Thresholds: F1 ≥ 0.95, exact ≥ 0.85, within ±1 ≥ 0.95. "F1" is min(micro, macro) (D-015 #4).
+
+  | Strategy | Frames run | F1 (p05) | Lowest class F1 | People exact (p05) | Within ±1 (p05) |
+  |---|---|---|---|---|---|
+  | all frames | 100% | 1.0000 | 1.0000 | 1.0000 | 1.0000 |
+  | uniform-1 | 3.6% | 0.932 (0.890) **fail** | — | 0.920 (0.897) | 0.990 |
+  | uniform-2 | 7.1% | 0.893 (0.826) **fail** | — | 0.915 | 0.993 |
+  | uniform-3 | 10.7% | 0.964 (0.941) | cell phone 0.919 | 0.952 (0.936) | 0.998 |
+  | uniform-5 | 17.8% | 0.975 (0.958) | cell phone 0.949 | 0.965 (0.952) | 0.999 |
+  | stride-5 | 20.0% | 0.965 (0.943) | — | 0.958 (0.945) | 0.998 |
+  | stride-10 | 10.0% | 0.943 (0.909) **fail** | — | 0.937 | 0.994 |
+  | staged-1>3>9-VN | 8.3% | 0.981 (0.972) | cell phone 0.965 | 0.959 (0.944) | 0.998 (0.997) |
+  | staged-3>9-V | 13.6% | 0.983 (0.976) | cell phone 0.969 | 0.961 (0.946) | 0.998 |
+  | **staged-1>3>9>all-VN** | **15.8%** | **0.994 (0.992)** | cell phone 0.987 | **0.966 (0.953)** | **0.998 (0.997)** |
+  | staged-3>9>all-V | 22.9% | 0.998 (0.997) | cell phone 0.994 | 0.969 (0.956) | 0.998 |
+  | **staged-1>3>all-VPN** | **25.0%** | **0.995 (0.992)** | cell phone 0.988 | **0.994 (0.992)** | **1.000 (1.000)** |
+  | staged-3>9>all-VP | 33.4% | 0.999 (0.998) | cell phone 0.995 | 0.998 (0.998) | 1.000 |
+  | staged-5>15>all-VPC | 46.2% | 1.0000 | 1.0000 | 1.0000 | 1.0000 |
+- **Findings:**
+  1. **Even k is worse than k − 1.** A 1-of-2 split is a tie, which counts as present (brief §5: at least half), so uniform-2 has lower F1 than uniform-1, and uniform-4 than uniform-3. Only odd stage sizes are used.
+  2. **Object F1 is the binding metric**, and the rarest class (cell phone, 1.8% of seconds) limits macro F1. People exact has a lot of slack (0.85 needed, 0.95 or more reached).
+  3. **Escalating on person-count disagreement (P) is expensive**, because counts change between frames often. It buys people exactness, which has the most slack.
+  4. **The neighbour test (N) is what makes a 1-frame first stage work.** It catches objects appearing or disappearing between seconds.
+  5. **The confidence test (C) adds cost for little gain.** It can only see detections at or above 0.4, because detections below the threshold aren't stored.
+  6. Sequential and diverse parts behave the same, within about 0.01.
+  7. Single videos can be much worse than the pool: the worst video's people exact is 0.59 to 0.65 without P, and 0.89 with `staged-1>3>all-VPN`. The grade is pooled over about 13 h, so this matters only if the test set is a few videos.
+- **Caveats:**
+  - These results hold for FP32 PyTorch detections. FP16 or TensorRT change confidences slightly, so the chosen strategy must be re-validated after any inference-engine change. The errors may add up.
+  - The real wall time is not proportional to frames run: decoding every frame, buffering, and more inference passes per second add cost. It has to be timed (D-002).
+- **Implementation needs** (for any staged strategy): buffer one second of decoded frames (as YUV `VideoFrame`s; only frames sent to the model are converted to BGR), keep one second of look-ahead for N, and batch first-stage and escalation frames from the same video together (the shapes stay equal, D-015 C2).
+- **Alternatives not tested:**
+  - Scene-change or frame-difference sampling: it needs pixel work on every frame, and the neighbour test already covers changes between seconds.
+  - Running the model at conf 0.25 to see detections just below 0.4: that can't be simulated from the stored reference and would need a new GPU run.
 
 ---
 
