@@ -1,0 +1,353 @@
+{
+ "version": 1,
+ "seed": 20261121,
+ "n_videos": 48,
+ "files": {
+  "train-00201-of-01357.parquet": {
+   "part": "holdout",
+   "dir": "data/finevideo_holdout/data",
+   "rows": 33,
+   "size_bytes": 411115624,
+   "sha256": "892fce2a0ce7ae15231378ae38a2a2d1effe47d5d8de9a6a188adc77bb82d56e"
+  },
+  "train-00218-of-01357.parquet": {
+   "part": "holdout",
+   "dir": "data/finevideo_holdout/data",
+   "rows": 33,
+   "size_bytes": 518369758,
+   "sha256": "829323250a566c1480e830f115bec78b22ff6e877d322facee4d0d093cde2eab"
+  },
+  "train-00409-of-01357.parquet": {
+   "part": "holdout",
+   "dir": "data/finevideo_holdout/data",
+   "rows": 32,
+   "size_bytes": 591536109,
+   "sha256": "2784cb046ebe5452e32866229c8545977d8f7bce5d4a5e3eb292129d0d397622"
+  },
+  "train-00628-of-01357.parquet": {
+   "part": "holdout",
+   "dir": "data/finevideo_holdout/data",
+   "rows": 32,
+   "size_bytes": 511852301,
+   "sha256": "0c0d4bc3cfe623e7886c9effd579fc16315867d7270a7dc3c2ca137471a82b6e"
+  },
+  "train-00745-of-01357.parquet": {
+   "part": "holdout",
+   "dir": "data/finevideo_holdout/data",
+   "rows": 32,
+   "size_bytes": 481865009,
+   "sha256": "56f2c230ec6b4e662977c529d40c955f3e9cee970152d41f6be50e75c70c958e"
+  },
+  "train-00767-of-01357.parquet": {
+   "part": "holdout",
+   "dir": "data/finevideo_holdout/data",
+   "rows": 32,
+   "size_bytes": 482628375,
+   "sha256": "c21692b99f40df9d7d8595eef9afb759fb992950a00b2296a86bf1a1e6380111"
+  },
+  "train-01137-of-01357.parquet": {
+   "part": "holdout",
+   "dir": "data/finevideo_holdout/data",
+   "rows": 32,
+   "size_bytes": 561749215,
+   "sha256": "5fbfc6d17f8759e75f7121791105c7450499db791c33cf1d45cf579ff8aeab5e"
+  },
+  "train-01307-of-01357.parquet": {
+   "part": "holdout",
+   "dir": "data/finevideo_holdout/data",
+   "rows": 32,
+   "size_bytes": 441387479,
+   "sha256": "23539fc94febfb7f426b63afa1343c71815e1e399406ecfc694c26ba447fd20c"
+  }
+ },
+ "videos": [
+  {
+   "video": "train-00201-of-01357.parquet:12",
+   "file": "train-00201-of-01357.parquet",
+   "row": 12,
+   "part": "holdout"
+  },
+  {
+   "video": "train-00201-of-01357.parquet:15",
+   "file": "train-00201-of-01357.parquet",
+   "row": 15,
+   "part": "holdout"
+  },
+  {
+   "video": "train-00201-of-01357.parquet:19",
+   "file": "train-00201-of-01357.parquet",
+   "row": 19,
+   "part": "holdout"
+  },
+  {
+   "video": "train-00201-of-01357.parquet:20",
+   "file": "train-00201-of-01357.parquet",
+   "row": 20,
+   "part": "holdout"
+  },
+  {
+   "video": "train-00201-of-01357.parquet:21",
+   "file": "train-00201-of-01357.parquet",
+   "row": 21,
+   "part": "holdout"
+  },
+  {
+   "video": "train-00201-of-01357.parquet:32",
+   "file": "train-00201-of-01357.parquet",
+   "row": 32,
+   "part": "holdout"
+  },
+  {
+   "video": "train-00218-of-01357.parquet:0",
+   "file": "train-00218-of-01357.parquet",
+   "row": 0,
+   "part": "holdout"
+  },
+  {
+   "video": "train-00218-of-01357.parquet:2",
+   "file": "train-00218-of-01357.parquet",
+   "row": 2,
+   "part": "holdout"
+  },
+  {
+   "video": "train-00218-of-01357.parquet:3",
+   "file": "train-00218-of-01357.parquet",
+   "row": 3,
+   "part": "holdout"
+  },
+  {
+   "video": "train-00218-of-01357.parquet:12",
+   "file": "train-00218-of-01357.parquet",
+   "row": 12,
+   "part": "holdout"
+  },
+  {
+   "video": "train-00218-of-01357.parquet:20",
+   "file": "train-00218-of-01357.parquet",
+   "row": 20,
+   "part": "holdout"
+  },
+  {
+   "video": "train-00218-of-01357.parquet:25",
+   "file": "train-00218-of-01357.parquet",
+   "row": 25,
+   "part": "holdout"
+  },
+  {
+   "video": "train-00409-of-01357.parquet:7",
+   "file": "train-00409-of-01357.parquet",
+   "row": 7,
+   "part": "holdout"
+  },
+  {
+   "video": "train-00409-of-01357.parquet:10",
+   "file": "train-00409-of-01357.parquet",
+   "row": 10,
+   "part": "holdout"
+  },
+  {
+   "video": "train-00409-of-01357.parquet:13",
+   "file": "train-00409-of-01357.parquet",
+   "row": 13,
+   "part": "holdout"
+  },
+  {
+   "video": "train-00409-of-01357.parquet:15",
+   "file": "train-00409-of-01357.parquet",
+   "row": 15,
+   "part": "holdout"
+  },
+  {
+   "video": "train-00409-of-01357.parquet:22",
+   "file": "train-00409-of-01357.parquet",
+   "row": 22,
+   "part": "holdout"
+  },
+  {
+   "video": "train-00409-of-01357.parquet:29",
+   "file": "train-00409-of-01357.parquet",
+   "row": 29,
+   "part": "holdout"
+  },
+  {
+   "video": "train-00628-of-01357.parquet:8",
+   "file": "train-00628-of-01357.parquet",
+   "row": 8,
+   "part": "holdout"
+  },
+  {
+   "video": "train-00628-of-01357.parquet:9",
+   "file": "train-00628-of-01357.parquet",
+   "row": 9,
+   "part": "holdout"
+  },
+  {
+   "video": "train-00628-of-01357.parquet:12",
+   "file": "train-00628-of-01357.parquet",
+   "row": 12,
+   "part": "holdout"
+  },
+  {
+   "video": "train-00628-of-01357.parquet:16",
+   "file": "train-00628-of-01357.parquet",
+   "row": 16,
+   "part": "holdout"
+  },
+  {
+   "video": "train-00628-of-01357.parquet:22",
+   "file": "train-00628-of-01357.parquet",
+   "row": 22,
+   "part": "holdout"
+  },
+  {
+   "video": "train-00628-of-01357.parquet:23",
+   "file": "train-00628-of-01357.parquet",
+   "row": 23,
+   "part": "holdout"
+  },
+  {
+   "video": "train-00745-of-01357.parquet:4",
+   "file": "train-00745-of-01357.parquet",
+   "row": 4,
+   "part": "holdout"
+  },
+  {
+   "video": "train-00745-of-01357.parquet:9",
+   "file": "train-00745-of-01357.parquet",
+   "row": 9,
+   "part": "holdout"
+  },
+  {
+   "video": "train-00745-of-01357.parquet:10",
+   "file": "train-00745-of-01357.parquet",
+   "row": 10,
+   "part": "holdout"
+  },
+  {
+   "video": "train-00745-of-01357.parquet:12",
+   "file": "train-00745-of-01357.parquet",
+   "row": 12,
+   "part": "holdout"
+  },
+  {
+   "video": "train-00745-of-01357.parquet:29",
+   "file": "train-00745-of-01357.parquet",
+   "row": 29,
+   "part": "holdout"
+  },
+  {
+   "video": "train-00745-of-01357.parquet:30",
+   "file": "train-00745-of-01357.parquet",
+   "row": 30,
+   "part": "holdout"
+  },
+  {
+   "video": "train-00767-of-01357.parquet:7",
+   "file": "train-00767-of-01357.parquet",
+   "row": 7,
+   "part": "holdout"
+  },
+  {
+   "video": "train-00767-of-01357.parquet:13",
+   "file": "train-00767-of-01357.parquet",
+   "row": 13,
+   "part": "holdout"
+  },
+  {
+   "video": "train-00767-of-01357.parquet:19",
+   "file": "train-00767-of-01357.parquet",
+   "row": 19,
+   "part": "holdout"
+  },
+  {
+   "video": "train-00767-of-01357.parquet:22",
+   "file": "train-00767-of-01357.parquet",
+   "row": 22,
+   "part": "holdout"
+  },
+  {
+   "video": "train-00767-of-01357.parquet:23",
+   "file": "train-00767-of-01357.parquet",
+   "row": 23,
+   "part": "holdout"
+  },
+  {
+   "video": "train-00767-of-01357.parquet:30",
+   "file": "train-00767-of-01357.parquet",
+   "row": 30,
+   "part": "holdout"
+  },
+  {
+   "video": "train-01137-of-01357.parquet:6",
+   "file": "train-01137-of-01357.parquet",
+   "row": 6,
+   "part": "holdout"
+  },
+  {
+   "video": "train-01137-of-01357.parquet:7",
+   "file": "train-01137-of-01357.parquet",
+   "row": 7,
+   "part": "holdout"
+  },
+  {
+   "video": "train-01137-of-01357.parquet:15",
+   "file": "train-01137-of-01357.parquet",
+   "row": 15,
+   "part": "holdout"
+  },
+  {
+   "video": "train-01137-of-01357.parquet:17",
+   "file": "train-01137-of-01357.parquet",
+   "row": 17,
+   "part": "holdout"
+  },
+  {
+   "video": "train-01137-of-01357.parquet:18",
+   "file": "train-01137-of-01357.parquet",
+   "row": 18,
+   "part": "holdout"
+  },
+  {
+   "video": "train-01137-of-01357.parquet:27",
+   "file": "train-01137-of-01357.parquet",
+   "row": 27,
+   "part": "holdout"
+  },
+  {
+   "video": "train-01307-of-01357.parquet:1",
+   "file": "train-01307-of-01357.parquet",
+   "row": 1,
+   "part": "holdout"
+  },
+  {
+   "video": "train-01307-of-01357.parquet:3",
+   "file": "train-01307-of-01357.parquet",
+   "row": 3,
+   "part": "holdout"
+  },
+  {
+   "video": "train-01307-of-01357.parquet:8",
+   "file": "train-01307-of-01357.parquet",
+   "row": 8,
+   "part": "holdout"
+  },
+  {
+   "video": "train-01307-of-01357.parquet:14",
+   "file": "train-01307-of-01357.parquet",
+   "row": 14,
+   "part": "holdout"
+  },
+  {
+   "video": "train-01307-of-01357.parquet:21",
+   "file": "train-01307-of-01357.parquet",
+   "row": 21,
+   "part": "holdout"
+  },
+  {
+   "video": "train-01307-of-01357.parquet:25",
+   "file": "train-01307-of-01357.parquet",
+   "row": 25,
+   "part": "holdout"
+  }
+ ]
+}

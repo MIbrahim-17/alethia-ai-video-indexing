@@ -48,7 +48,9 @@ These are requirements we can't change. They are listed so that any proposed dec
 | D-013 | Synthetic fixture suite for unusual and damaged videos | Accepted | 2026-11-20 |
 | D-014 | Every-frame reference builder design | Accepted (3 items pending confirmation) | 2026-11-20 |
 | D-015 | Baseline `run.py` and scorer design | Accepted (baseline v1 measured 2026-11-20) | 2026-11-20 |
-| D-016 | Frame sampling: techniques tested and results | Experiment done, strategy not chosen | 2026-11-20 |
+| D-016 | Frame sampling: techniques tested and results | Experiment done (strategy chosen in D-017) | 2026-11-20 |
+| D-017 | Staged sampling `staged-1>3>all-VPN` in `run.py` | Accepted, provisional (holdout passed 2026-11-20) | 2026-11-20 |
+| D-018 | Untouched correctness holdout | Accepted | 2026-11-20 |
 
 ### D-001: Development and benchmark server
 - **Status:** Accepted · **Date:** 2026-11-20
@@ -425,6 +427,69 @@ These are requirements we can't change. They are listed so that any proposed dec
   - Scene-change or frame-difference sampling: it needs pixel work on every frame, and the neighbour test already covers changes between seconds.
   - Running the model at conf 0.25 to see detections just below 0.4: that can't be simulated from the stored reference and would need a new GPU run.
 
+- **Update 2026-11-20:** the user chose `staged-1>3>all-VPN`, provisionally (D-017). `staged-1>3>9>all-VN` (15.8% of frames) stays documented here as the faster alternative, to consider only if VPN's measured runtime isn't enough. It isn't implemented in `run.py`.
+
+### D-017: Staged sampling `staged-1>3>all-VPN` in `run.py`
+- **Status:** Accepted, **provisional** (the user's choice, pending the holdout check in D-018) · **Date:** 2026-11-20 · Carries out D-016.
+- **Decision:**
+  - `run.py --sampling staged-1>3>all-VPN` is the default.
+  - `--sampling all` is the every-frame baseline (D-015), kept as the fallback.
+  - No other strategy is selectable.
+- **Rules (exactly the simulator's `strat_staged`):**
+  1. **Stage 1:** the middle frame of each second (position `n // 2`).
+  2. **Escalate to stage 2** when the second has more than one frame and **N** holds: its stage-1 result (objects, people) differs from the previous or next second's stage-1 result. A second with no frames counts as (no objects, 0). The first second has no previous neighbour, and the last second has no next one.
+  3. **Stage 2:** add the uniform-3 frames (positions `(2j + 1) · n // 6`, which include the middle frame). If frames are still left out and **V** (the frames disagree on some object) or **P** (they disagree on the person count) holds, go to stage 3.
+  4. **Stage 3:** every frame of the second.
+  5. **Aggregation:** the brief §5 rules over every frame run for that second.
+- **Implementation:**
+  - Decoded frames are kept as YUV `VideoFrame`s. Only frames sent to the model are converted to BGR and rotated (`frame_to_bgr`).
+  - Up to 32 seconds or about 1 GB of frames are buffered per chunk. The last second of each chunk waits for its next neighbour.
+  - Each stage is batched over every buffered second (batches of at most 32 frames or 1 GB, never mixing videos). A frame is never run twice.
+  - The error handling is the same as the baseline's: a decode failure or a timestamp going back keeps every second decoded so far (the partial second too, unless `--drop-partial-second`), then writes one error line.
+- **Changes to shared code (the baseline path is unaffected):**
+  - Decoding is split into `iter_raw_frames` plus `frame_to_bgr`; `iter_frames` is rebuilt on top of them and does the same work in the same order.
+  - `Detector._predict` now sends only same-shape runs to one predict call. This makes the D-015 C2 rule hold even if a video changes resolution partway; no real video does.
+  - It also counts predict calls and inferred frames.
+- **Validation (2026-11-20):**
+  - **Layer 3 (unit tests):** 18 of 18 pass, 6 of them new. On 60 random synthetic videos (frame rates 1–60, gaps, videos up to 4 chunks long), the output and the set of frames sent to the model equal the simulator's exactly, and no frame is run twice. `uniform_positions` equals the simulator's float rule for n < 400 and k ∈ {1, 3, 5, 9, 15}.
+  - **Real run on all 101 videos, GPU 0:** the output equals the simulator's prediction on **all 27,388 seconds (0 differences)**. The inferred-frame count equals the simulator's for **every one of the 101 videos** (191,848 in total, 25.0%). No differences were found, so there was nothing to investigate.
+  - **`score.py` (independent of the simulator):** F1 micro 0.9978, macro 0.9947, gate 0.9947. Lowest class: cell phone 0.9876. People exact 0.9940, within ±1 0.9999. Complete, PASS. The worst video's people exact is 0.889 (`train-00001:19`).
+  - **Fixtures:** 17 of 17 pass with `--sampling staged-1>3>all-VPN` (the oracle applies the simulator's selection to cv2-decoded, single-frame-predicted frames) and 17 of 17 with `--sampling all`.
+  - **The fallback still equals the baseline:** `--sampling all` on 6 diverse videos (37,741 frames, 1,292 seconds) is byte-for-byte identical to the reference, at 136.5 fps (the baseline speed).
+  - **Timing:** S-3 in the Speed log. The 66 sequential videos took **1,049 s against 3,833 s, 3.65× faster.**
+- **Observations for the next optimisations:**
+  - Only 24% of frames are run, yet the speed-up is 3.65×, not 4.2×. Frames run per second of wall time fell from 137 to 120. Likely causes: smaller and partial batches (4,494 predict calls, about 28 frames per call), decoding every frame, and Python work per second, all on one CPU core (CPU 105%).
+  - Peak memory rose from 3.9 to 5.4 GB because of frame buffering.
+- **Alternatives considered:**
+  - `staged-1>3>9>all-VN` (faster, people exact about 0.966); documented only (D-016 update).
+  - Decoding each video twice instead of buffering frames: simpler memory use, but double decoding.
+- **Update 2026-11-20:** it passes the untouched holdout (D-018): F1 gate 0.9947, people exact 0.9950, within ±1 0.9999, identical to the simulator. It's still provisional, as the user asked, and stays the default until the user confirms it or a later change (for example the inference engine) forces a re-check.
+
+### D-018: Untouched correctness holdout
+- **Status:** Accepted · **Date:** 2026-11-20 · Validation layer 5 (D-004).
+- **Context:** The 101-video subset was used to choose the sampling strategy, so its scores are optimistic. An untouched set is needed to confirm a chosen configuration.
+- **Decision:**
+  - `validation/holdout/select_holdout.py` with seed 20261121. It draws **8 files uniformly** from `train-00050` … `train-01356` (leaving out the 50 graded files and every file in the 101-video subset): 00201, 00218, 00409, 00628, 00745, 00767, 01137 and 01307.
+  - Then it draws **6 rows uniformly per file** (seed + 1), for **48 videos**.
+  - This is a plain random sample, unlike the rarity-weighted diverse sample (D-012), so it stands for FineVideo as it is.
+  - The sample is frozen with sha256 values in `validation/holdout/holdout_subset.json`.
+  - **Rule:** the holdout only confirms or rejects a configuration that has already been chosen. Nothing is tuned on it, and every result is recorded whatever it is.
+- **Reference:**
+  - Built with the same `build_reference.py` on both GPUs: 48 videos, 403,553 frames, 14,341 seconds (3.98 h of video), in 24.6 min.
+  - `check_reference.py`: 0 failures. Frame counts match the probe (`probe_holdout.py`, the same `probe_video` as D-012), time bases agree on all 403,553 frames, and 400 frames re-run one at a time match the batched results.
+  - The reference stays on the server (`work/holdout_ref/`).
+- **Result for `staged-1>3>all-VPN` (D-017), GPU 0:**
+  - F1 micro 0.9979, macro 0.9947, **gate 0.9947**. Lowest class: cell phone 0.9847.
+  - **People exact 0.9950, within ±1 0.9999.** Complete, PASS.
+  - The worst video's people exact is 0.978.
+  - 96,149 frames run (23.8%), 3,445 predict calls.
+  - The output equals the simulator's prediction on all 14,341 seconds, and the frame count matches for all 48 videos.
+  - Timing: S-4.
+- **Alternatives considered:**
+  - Reusing the diverse sample: it was used for the choice, so it isn't untouched.
+  - A holdout from the 50 graded files: those are the final output, and the brief's test set is hidden, so a separate set is cleaner.
+  - Feature-weighted selection: it's biased toward rare cases. The diverse sample already covers those.
+- **Consequences:** about 3.9 GB of disk (46 GB free afterwards).
 ---
 
 ## Speed log
@@ -435,6 +500,9 @@ Every timed run, in order, so each optimisation can be compared with the one bef
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
 | S-1 | 2026-11-20 | Baseline v1, every frame, batch 32, FP32 PyTorch (D-015) | sequential subset (`train-00000`, `train-00001`) | 0 (RTX 6000) | 66 / 526,328 / 5.21 h | 3,833 s (63.9 min) | 137.3 | 0.204 | ≈25.5 h | ≈2.7 h | identical (all metrics 1.0000) | CPU 105% (one core), peak RSS 3.9 GB, GPU ≈90%. GPU 1 busy with S-2 for the first 33 min. **The timing figure of record for the baseline.** |
 | S-2 | 2026-11-20 | Baseline v1 (D-015) | diverse subset (10 files) | 1 (RTX 6000, ≈10.7 GB held by ollama) | 35 / 240,937 / 2.38 h | 1,988 s (33.1 min) | 121.2 | 0.232 | — | — | identical (all metrics 1.0000) | Run for accuracy only. GPU 1 is not the benchmark GPU, so this timing isn't compared with others. |
+| S-3 | 2026-11-20 | Staged sampling `staged-1>3>all-VPN` (D-017) | sequential subset (`train-00000`, `train-00001`) | 0 (RTX 6000), alone | 66 / 526,328 / 5.21 h | **1,049 s (17.5 min)**; 17:30 for the whole process | 501.6 (frames run per second of wall time: 120.3) | 0.0559 | ≈7.0 h | ≈0.73 h (44 min) | F1 gate 0.9947, exact 0.9940, within ±1 0.9999 on all 101 videos; identical to the simulator | 126,201 frames run (24.0%), 4,494 predict calls, CPU 105%, peak RSS 5.43 GB. **3.65× faster than S-1.** |
+| S-3b | 2026-11-20 | Same as S-3 | diverse subset (10 files) | 0 (RTX 6000) | 35 / 240,937 / 2.38 h | 541 s (9.0 min) | 445.1 | 0.0632 | — | — | (pooled with S-3 above) | 65,647 frames run (27.2%), 2,335 predict calls, peak RSS 5.51 GB. The holdout download (network only) overlapped this run, so it's for information only. |
+| S-4 | 2026-11-20 | `staged-1>3>all-VPN` (D-017) | holdout (D-018) | 0 (RTX 6000), alone | 48 / 403,553 / 3.98 h | 827 s (13.8 min) | 487.7 | 0.0577 | ≈7.2 h | ≈0.75 h | holdout: F1 gate 0.9947, exact 0.9950, within ±1 0.9999 | 96,149 frames run (23.8%), 3,445 predict calls, peak RSS 5.58 GB. Agrees with S-3 (0.0559 s per video-s). |
 
 <!--
 Template for new entries (copy below this line):

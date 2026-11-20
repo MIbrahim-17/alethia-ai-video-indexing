@@ -20,6 +20,7 @@ import argparse
 import io
 import json
 import math
+import re
 import subprocess
 import sys
 import tempfile
@@ -34,6 +35,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "validation"))
 sys.path.insert(0, str(ROOT))
 from reference_aggregate import TARGETS, aggregate_video  # noqa: E402
+from simulate_sampling import select_staged  # noqa: E402
 
 
 def cv2_frames(mp4: bytes):
@@ -67,15 +69,22 @@ def main():
     ap.add_argument("--fixtures", required=True)
     ap.add_argument("--skip-run", action="store_true")
     ap.add_argument("--weights", default=str(ROOT / "weights" / "yolo11l.pt"))
+    ap.add_argument("--sampling", default="all", help="run.py --sampling; the oracle applies the "
+                    "simulator's selection rule (validation/simulate_sampling.py) for staged strategies")
     a = ap.parse_args()
+    stage_rule = None
+    if a.sampling != "all":
+        m = re.fullmatch(r"staged-([0-9a-z>]+)-([VPCN]+)", a.sampling)
+        stage_rule = (tuple(0 if x == "all" else int(x) for x in m.group(1).split(">")), m.group(2))
 
     fdir = Path(a.fixtures)
     manifest = json.loads((fdir / "manifest.json").read_text())
-    out_path = fdir / "run_output.jsonl"
+    out_path = fdir / f"run_output_{a.sampling.replace('>', '_')}.jsonl"
     if not a.skip_run:
         r = subprocess.run([sys.executable, str(ROOT / "run.py"), "--input", str(fdir / "input"),
-                            "--output", str(out_path)], capture_output=True, text=True)
-        (fdir / "run_stderr.log").write_text(r.stderr)
+                            "--output", str(out_path), "--sampling", a.sampling],
+                           capture_output=True, text=True)
+        (fdir / f"run_stderr_{a.sampling.replace('>', '_')}.log").write_text(r.stderr)
         if r.returncode != 0:
             print(r.stderr[-3000:])
             raise SystemExit(f"run.py exited {r.returncode}")
@@ -132,6 +141,9 @@ def main():
                 for img in frames:
                     r = model.predict(img, imgsz=640, conf=0.4, iou=0.7, verbose=False)[0]
                     dets.append([tid[int(c)] for c in r.boxes.cls.tolist() if int(c) in tid])
+                if stage_rule is not None:  # keep only the frames the staged rule picks
+                    keep = select_staged(secs, dets, *stage_rule)
+                    secs, dets = [secs[i] for i in keep], [dets[i] for i in keep]
                 exp = [{"video": vid, **e} for e in aggregate_video(secs, dets)]
                 want_errs = 1 if partial else 0
                 if got != exp or len(errs) != want_errs:

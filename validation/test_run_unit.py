@@ -152,6 +152,134 @@ def test_rotation_k_mapping():
     assert run.rotation_k(Fr(0), St("90")) == 3  # the old clockwise tag: 90° cw = 270° ccw
 
 
+# ---------------------------------------------------------------- staged sampling (D-017)
+
+class CountingDetector(FakeDetector):
+    def __init__(self):
+        self.n_frames = self.n_calls = 0
+        self.seen = []
+
+    def detect(self, imgs):
+        self.n_calls += 1
+        self.n_frames += len(imgs)
+        self.seen += [im.i for im in imgs]
+        return super().detect(imgs)
+
+
+class _RawImg(list):
+    nbytes = 1
+
+    def __init__(self, boxes, i):
+        super().__init__(boxes)
+        self.i = i
+
+
+def run_staged(spec, fail_after=None, keep_partial=True, stages=(1, 3, 0), flags="VPN"):
+    w, det = FakeWriter(), CountingDetector()
+    orig = run.iter_raw_frames, run.frame_to_bgr
+
+    def gen(_mp4):
+        for i, (t, boxes) in enumerate(spec):
+            if fail_after is not None and i == fail_after:
+                raise run.VideoError("decode failed: simulated")
+            yield Fraction(t), _RawImg(boxes, i), 0
+
+    run.iter_raw_frames, run.frame_to_bgr = gen, (lambda vf, k: vf)
+    try:
+        run.process_video_staged("v:0", b"x", det, w, keep_partial, stages, flags)
+    finally:
+        run.iter_raw_frames, run.frame_to_bgr = orig
+    return w.lines(), det
+
+
+def _random_video(rng, n_sec):
+    """Random frame rate per video, random gaps, objects that persist for a few seconds."""
+    import numpy as np  # noqa: F401
+    fps = int(rng.choice([1, 2, 3, 5, 12, 24, 25, 30, 60]))
+    spec, state = [], [0, 0, 0, 0, 0]
+    t = Fraction(0)
+    for s in range(n_sec):
+        if s > 0 and rng.random() < 0.05:
+            continue  # a second with no frames
+        state = [x if rng.random() < 0.8 else int(rng.integers(0, 3)) for x in state]
+        for j in range(fps):
+            boxes = []
+            for k, x in enumerate(state):
+                c = x + (1 if rng.random() < 0.15 else 0) - (1 if x and rng.random() < 0.15 else 0)
+                boxes += [k] * int(c)
+            spec.append((Fraction(s) + Fraction(j, fps), boxes))
+    return spec
+
+
+def _simulator_output(spec, stages, flags):
+    import numpy as np
+    sys.path.insert(0, str(ROOT / "validation"))
+    import simulate_sampling as sim
+
+    sec = np.array([int(t // 1) for t, _ in spec])
+    pres = np.array([[k in b for k in range(5)] for _, b in spec], bool)
+    cnt = np.array([b.count(P) for _, b in spec])
+    n_sec = int(sec.max()) + 1
+    v = {"sec": sec, "t": np.array([float(t) for t, _ in spec]), "pres": pres, "cnt": cnt,
+         "minconf": np.ones(len(spec)), "bounds": np.searchsorted(sec, np.arange(n_sec + 1)),
+         "n_sec": n_sec}
+    sel = sim.strat_staged(v, stages, flags)
+    out = []
+    for s, idx in enumerate(sel):
+        p, c = sim.agg(v, idx)
+        out.append((s, [run.TARGETS[k] for k in range(5) if p[k]], c))
+    return out, sorted(int(i) for idx in sel for i in idx)
+
+
+def test_staged_matches_simulator_exactly():
+    import numpy as np
+    rng = np.random.default_rng(7)
+    for trial in range(60):
+        spec = _random_video(rng, int(rng.integers(1, 120)))  # up to ~4 chunks of 32 seconds
+        lines, det = run_staged(spec)
+        want, want_frames = _simulator_output(spec, (1, 3, 0), "VPN")
+        assert secs(lines) == want, f"trial {trial}: output differs from the simulator"
+        assert sorted(det.seen) == want_frames, f"trial {trial}: different frames sent to the model"
+        assert len(set(det.seen)) == len(det.seen), f"trial {trial}: a frame was run twice"
+
+
+def test_staged_all_frames_equals_baseline():
+    import numpy as np
+    rng = np.random.default_rng(3)
+    for _ in range(20):
+        spec = _random_video(rng, int(rng.integers(1, 80)))
+        lines, det = run_staged(spec, stages=(0,), flags="")
+        assert secs(lines) == secs(run_video(spec)) and det.n_frames == len(spec)
+
+
+def test_staged_partial_failure_keeps_lines():
+    spec = [(i / 10, [P]) for i in range(35)]
+    lines, _ = run_staged(spec, fail_after=25)
+    assert [s for s, *_ in secs(lines)] == [0, 1, 2] and len(errs(lines)) == 1, lines
+    lines, _ = run_staged(spec, fail_after=25, keep_partial=False)
+    assert [s for s, *_ in secs(lines)] == [0, 1] and len(errs(lines)) == 1, lines
+
+
+def test_staged_timestamp_going_back_is_error():
+    lines, _ = run_staged([(0.0, [P]), (1.2, [P]), (0.5, [P])])
+    assert [s for s, *_ in secs(lines)] == [0, 1] and len(errs(lines)) == 1, lines
+
+
+def test_staged_first_frame_failure_and_empty():
+    lines, _ = run_staged([(0.0, [P])], fail_after=0)
+    assert secs(lines) == [] and len(errs(lines)) == 1
+    w = FakeWriter()
+    run.process_video_staged("v:0", b"", CountingDetector(), w, True, (1, 3, 0), "VPN")
+    assert w.lines() == [{"video": "v:0", "error": "empty or missing mp4 bytes"}]
+
+
+def test_uniform_positions_match_simulator_float_rule():
+    for n in range(0, 400):
+        for k in (1, 3, 5, 9, 15):
+            want = list(range(n)) if n <= k else sorted({int((j + 0.5) * n / k) for j in range(k)})
+            assert run.uniform_positions(n, k) == want, (n, k)
+
+
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_")]
     failed = 0

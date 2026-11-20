@@ -184,6 +184,17 @@ def strat_staged(v, stages, flags, c_lo=C_LO):
     return out
 
 
+def select_staged(seconds: list[int], det_cls: list[list[int]], stages, flags) -> list[int]:
+    """The frame indices strat_staged picks, for plain per-frame lists (used by check_fixtures)."""
+    sec = np.array(seconds, dtype=np.int64)
+    pres = np.array([[k in c for k in range(5)] for c in det_cls], bool).reshape(-1, 5)
+    n_sec = int(sec.max()) + 1
+    v = {"sec": sec, "pres": pres, "cnt": np.array([c.count(0) for c in det_cls], np.int64),
+         "minconf": np.ones(len(sec)), "bounds": np.searchsorted(sec, np.arange(n_sec + 1)),
+         "n_sec": n_sec}
+    return sorted(int(i) for idx in strat_staged(v, stages, flags) for i in idx)
+
+
 # ---------------------------------------------------------------- scoring
 
 def video_counts(v, sel):
@@ -239,6 +250,7 @@ def main():
     ap.add_argument("--ref", default="work/reference")
     ap.add_argument("--out", default="work/sampling/sim.json")
     ap.add_argument("--only-staged", action="store_true")
+    ap.add_argument("--dump", help="write this strategy's predicted JSONL and per-video frame counts, then stop")
     a = ap.parse_args()
     videos = load_reference(Path(a.ref))
     print(f"loaded {len(videos)} videos, {sum(len(v['sec']) for v in videos)} frames, "
@@ -283,6 +295,23 @@ def main():
         for flags in ("V", "VC", "VN", "VCN"):
             name = "staged-" + ">".join("all" if k == 0 else str(k) for k in stages) + "-" + flags
             strategies[name] = lambda v, st=stages, f=flags: strat_staged(v, st, f)
+    if a.dump:
+        fn = strategies[a.dump]
+        out = Path(a.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        counts = {}
+        with open(out, "w") as fo:
+            for v in videos:
+                sel = fn(v)
+                counts[v["video"]] = {"frames": int(len(v["sec"])), "inferred": int(sum(len(x) for x in sel))}
+                for sidx, idx in enumerate(sel):
+                    p, c = agg(v, idx)
+                    fo.write(json.dumps({"video": v["video"], "second": sidx,
+                                         "objects": [TARGETS[k] for k in range(5) if p[k]],
+                                         "people": c}) + "\n")
+        out.with_suffix(".counts.json").write_text(json.dumps(counts, indent=0))
+        print(f"dumped {a.dump}: {sum(c['inferred'] for c in counts.values())} frames inferred -> {out}")
+        return
     if a.only_staged:
         strategies = {k: f for k, f in strategies.items() if k.startswith("staged") or k == "all"}
 
