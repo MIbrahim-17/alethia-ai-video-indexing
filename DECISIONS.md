@@ -47,6 +47,7 @@ These are requirements we can't change. They are listed so that any proposed dec
 | D-012 | How the diverse sample was picked, and the resulting subset | Accepted (frozen 2026-11-20) | 2026-11-20 |
 | D-013 | Synthetic fixture suite for unusual and damaged videos | Accepted | 2026-11-20 |
 | D-014 | Every-frame reference builder design | Accepted (3 items pending confirmation) | 2026-11-20 |
+| D-015 | Baseline `run.py` and scorer design | Accepted (baseline v1 measured 2026-11-20) | 2026-11-20 |
 
 ### D-001: Development and benchmark server
 - **Status:** Accepted · **Date:** 2026-11-20
@@ -241,6 +242,33 @@ These are requirements we can't change. They are listed so that any proposed dec
 - **Consequences:**
   - Each fixture needs an expected output that can be derived by hand or independently, not just "whatever the reference produces".
   - Fixtures will be generated in code (PyAV) so they can be reproduced.
+- **Update 2026-11-20 (Critical suite built; all 17 fixtures pass against the baseline `run.py`):**
+  - **Generator:** `validation/fixtures/make_fixtures.py` writes all fixtures to one Parquet file (`work/fixtures/input/fixtures-critical.parquet`) plus a manifest.
+    - **Content:** P is a real FineVideo frame with one person the model is confident about (`train-00000:10`, frame 156, confidence 0.96). B is a flat grey frame.
+    - **Boundary and variable-frame-rate cases:** P and B frames alternate so that putting a frame in the wrong second changes the expected output.
+    - **Encoding:** H.264, time base 1/90000.
+  - **Checker:** `validation/fixtures/check_fixtures.py` derives each expected result independently of `run.py`:
+    - decoding with cv2's FFmpeg build, using OpenCV's own automatic rotation;
+    - timestamps from the times the fixture was built with;
+    - stock single-frame `predict`;
+    - grouping with `reference_aggregate.py`.
+
+    It also checks that each fixture is valid (the container's timestamps equal the intended ones). For rotation, it compares `run.py`'s decoded pixels with cv2's.
+  - **Unit tests:** `validation/test_run_unit.py` has 12 tests (layer 3) with a fake decoder and detector:
+    - ties and the floor of the median;
+    - gaps and exact second boundaries;
+    - failure partway through, in both keep and drop modes;
+    - timestamps going backwards;
+    - empty bytes;
+    - the rotation mapping.
+
+    All pass.
+  - **Rotation verified:** for 90°, 180° and 270°, `run.py`'s frames match cv2's automatic rotation pixel for pixel (difference 0.00 against 70 for a wrong turn), with the portrait shape. This closes the ⚠ rotation item in D-014 and D-015 C3.
+  - **Lesson from the first version:** damaged fixtures made from a near-lossless encode with a single keyframe were invalid. Frame 0 held most of the bytes, so any damage destroyed every frame, even for cv2. Damaged fixtures now use CRF 23, a keyframe every 10 frames and 100 frames.
+  - **Damaged-video behaviour, which now matches cv2:**
+    - a file truncated after the `moov` atom gives 6 complete seconds plus one error line, frame for frame the same as cv2, with no buffered frames lost;
+    - 4 kB of random bytes in the middle is hidden by the decoder (cv2 and PyAV both decode all 100 frames), so there are 10 seconds and no error line.
+  - **Not built yet:** the High and Medium fixtures (other codecs, 60 fps, 1080p and 4K, missing or duplicate timestamps, multiple streams).
 
 ### D-014: Every-frame reference builder design
 - **Status:** Accepted, with the items marked ⚠ pending the user's confirmation · **Date:** 2026-11-20 · Carries out D-003.
@@ -292,8 +320,49 @@ These are requirements we can't change. They are listed so that any proposed dec
     | cell phone | 1.8% |
 
     `people > 0` in 71.6% of seconds. The person-present/`people = 0` case from a 50% tie occurs in 91 seconds.
-- **Alternatives considered:**
-  - Using the stock `model.predict(source=video)` path. It decodes with cv2, gives no access to exact timestamps, and is harder to make resumable.
+- **⚠ Rotation source refined by D-015:** read `frame.rotation` first, then fall back to the stream's `rotate` tag.
+
+### D-015: Baseline `run.py` and scorer design
+- **Status:** Accepted · **Date:** 2026-11-20 · Carries out D-003, the first working version.
+- **What the baseline is:** an every-frame, batched, single-process pipeline on one GPU. Batching is already an optimisation, so this is described as a batched baseline, not as "unoptimised".
+- **Decisions:**
+
+  | # | Topic | Decision | Rejected alternative |
+  |---|---|---|---|
+  | 1 | Finding input | `sorted(glob("*.parquet"))` in the `--input` folder only, not subfolders | Recursive search: the brief says "a folder of Parquet files". Unsorted: order would vary between runs. |
+  | 2 | Unreadable Parquet file | If the footer is readable, write one valid error line per row (`file:0` … `file:N-1`). If not, report on stderr only and invent no video ID. The exit code is 0 for data problems; nonzero is only for crashes. | `file:?` (breaks the ID format). A nonzero exit (could make the whole run look failed). |
+  | 3 | Partial second after a failure partway through | **Keep it:** group the frames decoded so far, write that second, then the error line. It's a setting (`--drop-partial-second`) so it can be flipped. | Dropping it (proposed by the user, then withdrawn). Every normal video already ends on a partial second that the brief requires, we can't tell whether the second was really unfinished, and the graders' reference most likely groups whatever frames it decoded. This is a judgement call. |
+  | 4 | F1 averaging | Report micro, macro, per-class and sample-averaged F1. **Gate on min(micro, macro)**, with a margin above 0.95. Sample-averaged F1 is for information only, because the empty-versus-empty convention inflates it. | Gating on micro alone: hides failures on rare objects, since cell phone appears in only 1.8% of seconds. |
+  | C1 | Writing | Write a second as soon as a frame from a later second arrives. A frame landing in an already-written second is an error for that video. One writer only. Flush after each video. | Buffering whole videos: uses more memory and loses work if the run is stopped at the 6-hour limit. |
+  | C2 | Batching | Batches of up to 32 frames, **never mixing videos**, so all frames in a batch have the same shape and Ultralytics's `auto` letterbox matches single-frame results (checked, D-014). Batch size 1 is timed once as the naive starting point. | Batches across videos: mixed shapes switch to `auto=False` and pad to 640×640, which gives different detections. |
+  | C3 | Rotation | Isolated code: read `frame.rotation`, falling back to the stream's `rotate` tag. Apply it once with `np.rot90`. It's adopted only after the D-013 rotation fixtures pass against an independent tool (cv2 automatic rotation or ffmpeg automatic rotation). The baseline isn't held up for this, because no real video is rotated (D-012). | Blocking the baseline until rotation is verified: no score effect on real data. |
+  | C4 | Timestamps | `t = pts × frame.time_base − pts₀ × time_base₀` with exact fractions, falling back to the stream's time base. `frame.time` (a float) is never used. A frame without a timestamp is an error, and the D-013 fixture will define what happens then. `check_reference.py` gains a check that frame and stream time bases agree. | Stream time base only. Float times: wrong at exact second boundaries. |
+  | C5 | Memory | Decode queues and batches are limited by **bytes** (about 1 GB), so large frames make smaller batches. If CUDA runs out of memory, the batch is halved and retried before the video is given up with an error line. The same byte limit goes into `build_reference.py`. | Limits by frame count: a 256-frame queue at 4K is about 6.4 GB. Writing an error line straight away: loses all of a good video's seconds. |
+- **Scorer:** `validation/score.py` scores an output against `reference.jsonl`.
+  - A missing second counts as wrong. Extra or duplicate lines fail the check outright.
+  - It reports the brief's three metrics, the F1 variants in row 4, and breakdowns per video and per object.
+- **Result 2026-11-20 (baseline v1 measured):**
+  - **Accuracy:** on all 101 videos (27,388 seconds), the output is **identical to the reference**. Every F1 and both people metrics are 1.0000, with no missing, extra or duplicate lines and no errors. Fixtures: 17 of 17 pass. Unit tests: 12 of 12 pass.
+  - **Timing** (GPU 0, the 2 complete sequential files, run with no options):
+
+    | Measure | Value |
+    |---|---|
+    | Videos | 66 |
+    | Frames | 526,328 |
+    | Video length | 5.21 h |
+    | Wall time | **3,833 s (63.9 min)** |
+    | Speed | 137 fps |
+    | Wall time per second of video | 0.204 s |
+    | CPU | 105% (a single core) |
+    | Peak memory (RSS) | 3.9 GB |
+  - **Caveat:** for the first 33 minutes, the diverse accuracy run was using GPU 1 at the same time. There may have been a little CPU contention, so the numbers may be slightly pessimistic.
+  - **Estimates:**
+    - full 50 files (about 125 h of video): about **25.5 h** on one RTX 6000;
+    - the graders' 13 h test set: about **2.7 h** on an RTX 6000 (a 4090 will be faster; to be measured, not assumed).
+  - **Time-base check:** all 767,265 reference frames have `frame.time_base == stream.time_base`, so the reference stays valid with C4.
+  - **Where the time goes:** decoding alone is cheap. Decoding all 767k frames took about 67 CPU-seconds in total (about 11,000 fps per core, without converting to arrays). So the baseline is limited by inference and its single-threaded preprocessing (GPU at about 90%, one CPU core).
+- **Noted for optimisation later, not part of the baseline:** shrinking frames early, but only with exactly the same resize Ultralytics uses (the same size, `cv2.resize` INTER_LINEAR). It must pass validation layer 2 first.
+ It decodes with cv2, gives no access to exact timestamps, and is harder to make resumable.
   - Storing only per-second aggregates. That would lose the per-frame data that validation layers 2 and 3 need.
 
 <!--

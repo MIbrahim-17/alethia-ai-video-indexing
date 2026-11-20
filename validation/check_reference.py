@@ -45,6 +45,9 @@ def main():
     ap.add_argument("--recheck-frames", type=int, default=0)
     ap.add_argument("--recheck-videos", type=int, default=4)
     ap.add_argument("--weights", default="weights/yolo11l.pt")
+    ap.add_argument("--check-timebase", action="store_true",
+                    help="decode every frame and check frame.time_base == stream.time_base (D-015 C4)")
+    ap.add_argument("--workers", type=int, default=16)
     a = ap.parse_args()
 
     subset = json.loads(Path(a.subset).read_text())
@@ -117,6 +120,8 @@ def main():
     for k, val in sorted(stats.items()):
         print(f"  {k:24s} {val}")
 
+    if a.check_timebase:
+        fails += check_timebases(subset, a.workers)
     if a.recheck_frames:
         fails += recheck_batch_equivalence(subset, fdir, a)
 
@@ -124,6 +129,44 @@ def main():
     for f in fails[:50]:
         print("  FAIL", f)
     sys.exit(1 if fails else 0)
+
+
+def _timebase_one(args):
+    import av
+
+    vid, mp4 = args
+    with av.open(io.BytesIO(mp4)) as c:
+        s = c.streams.video[0]
+        n = bad = 0
+        for f in c.decode(s):
+            n += 1
+            bad += (f.time_base is not None) and (f.time_base != s.time_base)
+        return vid, n, bad, str(s.time_base)
+
+
+def check_timebases(subset, workers) -> list[str]:
+    """D-015 C4: the reference used the stream time base. It stays valid only if every frame's time base is the same."""
+    from concurrent.futures import ProcessPoolExecutor
+
+    def rows():
+        by_file = defaultdict(set)
+        for v in subset["videos"]:
+            by_file[v["file"]].add(v["row"])
+        for fname, wanted in sorted(by_file.items()):
+            meta = subset["files"][fname]
+            pf = pq.ParquetFile(Path(meta["dir"]) / fname)
+            for r, b in enumerate(pf.iter_batches(batch_size=1, columns=["mp4"])):
+                if r in wanted:
+                    yield f"{fname}:{r}", b.column("mp4")[0].as_py()
+
+    fails, n_frames = [], 0
+    with ProcessPoolExecutor(workers) as ex:
+        for vid, n, bad, tb in ex.map(_timebase_one, rows()):
+            n_frames += n
+            if bad:
+                fails.append(f"{vid}: {bad}/{n} frames have time_base != stream {tb}")
+    print(f"== time-base check: {n_frames} frames decoded, {len(fails)} videos with a different time base")
+    return fails
 
 
 def recheck_batch_equivalence(subset, fdir, a) -> list[str]:

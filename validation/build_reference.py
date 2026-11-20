@@ -36,9 +36,38 @@ def safe_name(video_id: str) -> str:
     return video_id.replace(":", "__")
 
 
+class ByteBoundedQueue:
+    """A FIFO queue limited by the total bytes of its frames, not their count (D-015 C5).
+
+    One item is always allowed, so a single huge frame can't deadlock the queue.
+    """
+
+    def __init__(self, max_bytes: int = 1 << 30):
+        self.max_bytes, self.bytes, self.items = max_bytes, 0, []
+        self.cv = threading.Condition()
+
+    def put(self, item):
+        size = item[1].nbytes if item is not None else 0
+        with self.cv:
+            while self.items and self.bytes + size > self.max_bytes:
+                self.cv.wait()
+            self.items.append((item, size))
+            self.bytes += size
+            self.cv.notify_all()
+
+    def get(self):
+        with self.cv:
+            while not self.items:
+                self.cv.wait()
+            item, size = self.items.pop(0)
+            self.bytes -= size
+            self.cv.notify_all()
+            return item
+
+
 # ---------------------------------------------------------------- decoding
 
-def decode_frames(mp4: bytes, out_q: queue.Queue, info: dict):
+def decode_frames(mp4: bytes, out_q, info: dict):
     """Decode every frame in presentation order and put (pts, bgr_array) items on out_q.
 
     The queue ends with None. Rotation from the display matrix is applied to each frame.
@@ -101,7 +130,7 @@ def gpu_worker(gpu: str, task_q, done_q, out_dir: str, weights: str, batch: int)
         rows = {"frame_idx": [], "pts": [], "t_rel": [], "second": [],
                 "det_cls": [], "det_conf": [], "det_xyxy": []}
         try:
-            fq: queue.Queue = queue.Queue(maxsize=256)
+            fq = ByteBoundedQueue(1 << 30)  # D-015 C5 (was a 256-frame queue)
             th = threading.Thread(target=decode_frames, args=(mp4, fq, info), daemon=True)
             th.start()
             first_pts = None
