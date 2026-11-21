@@ -1,7 +1,7 @@
 # Exact versions of every package run.py and prep.py need (the complete environment they were
 # validated in, D-025/D-026). Python 3.11, NVIDIA driver with CUDA 12 support.
-# torch/torchvision +cu126 builds come from the PyTorch index; TensorRT 10.16 from NVIDIA's index.
---extra-index-url https://download.pytorch.org/whl/cu126
+# torch/torchvision are the CUDA 12.6 builds, pinned as exact wheel URLs (with sha256) from the
+# PyTorch index, so pip never has to search that index. TensorRT 10.16 comes from NVIDIA's index.
 --extra-index-url https://pypi.nvidia.com
 anyio==4.16.0
 av==18.1.0
@@ -61,8 +61,8 @@ sympy==1.14.0
 tensorrt-cu12==10.16.1.11
 tensorrt-cu12-bindings==10.16.1.11
 tensorrt-cu12-libs==10.16.1.11
-torch==2.14.1+cu126
-torchvision==0.29.1+cu126
+torch @ https://download-r2.pytorch.org/whl/cu126/torch-2.14.1%2Bcu126-cp311-cp311-manylinux_2_28_x86_64.whl#sha256=acffcaa38f734dc04ba243d6192875a6ca185a2d2f19aac07fd16dc1aa7c926f
+torchvision @ https://download-r2.pytorch.org/whl/cu126/torchvision-0.29.1%2Bcu126-cp311-cp311-manylinux_2_28_x86_64.whl#sha256=c9e3cb4f609341d418d40a9bbae4280a029f9839d32f123f1c9bcc99aa003843
 triton==3.8.0
 typing-extensions==4.16.0
 tzdata==2026.6

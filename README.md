@@ -26,7 +26,7 @@ python prep.py
 
 A TensorRT engine only works on the GPU model and TensorRT version it was built with, so it has to be built on the grading machine. Building took about 6 minutes on our Quadro RTX 6000.
 
-`requirements.txt` pulls about 9 GB of wheels. These include `tensorrt-cu12-libs` (4 GB) from NVIDIA's package index and the CUDA 12.6 builds of `torch` from PyTorch's index. Both indexes are listed at the top of the file.
+`requirements.txt` pulls about 9 GB of wheels. These include `tensorrt-cu12-libs` (4 GB) from NVIDIA's package index, listed at the top of the file, and the CUDA 12.6 builds of `torch` and `torchvision`, pinned as exact wheel URLs with sha256.
 
 ### Timed run (offline)
 
