@@ -1,8 +1,9 @@
 """Check a full run's results.jsonl for completeness, independently of run.py (D-026).
 
-Expected seconds come from demuxing each video's packet timestamps (no decoding): a second
-is expected if at least one packet's presentation time, relative to the earliest one, falls
-in it. Checks:
+Expected seconds come from demuxing each video's packet timestamps (no decoding): every
+second from 0 to the one holding the last packet, relative to the earliest packet. A second
+with no packets (a timestamp gap) is still expected, because run.py writes it with no objects
+and 0 people (D-014). Checks:
   - every line parses and has the required schema; no error lines;
   - every row of every input Parquet file appears as a video, and no other video does;
   - each video's lines are contiguous, with seconds strictly increasing (no duplicates);
@@ -46,7 +47,7 @@ def expected_for_file(path):
                         tb = p.time_base or st.time_base
                         pts.append(p.pts * Fraction(tb.numerator, tb.denominator))
                 t0 = min(pts)
-                out[vid] = (sorted({math.floor(t - t0) for t in pts}), len(pts), None)
+                out[vid] = (list(range(math.floor(max(pts) - t0) + 1)), len(pts), None)
             except Exception as e:  # noqa: BLE001
                 out[vid] = (None, 0, f"{type(e).__name__}: {e}")
     return out

@@ -49,7 +49,7 @@ There is one JSON line per second of each video, in input order:
 - **`video`** is `<parquet file name>:<row index>`.
 - **`second`** is counted from the first decoded frame.
 - **`objects`** is in the fixed order person, car, dog, laptop, cell phone.
-- **Seconds with no frames** produce no line.
+- **Seconds with no frames** still get a line, with `"objects": []` and `"people": 0`: every second from 0 to the one holding the last frame is written. This happens when there is a timestamp gap inside a video.
 
 If a file or video can't be read, decoding stops partway through, or the GPU runs out of memory on a single frame, the run carries on. For a video, it writes an `{"video": ..., "error": ...}` line and keeps the seconds it had finished. A Parquet file that can't be read at all is reported as a `WARNING` on stderr, and the run moves on to the next file.
 
