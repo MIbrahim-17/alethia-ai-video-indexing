@@ -58,6 +58,9 @@ These are requirements we can't change. They are listed so that any proposed dec
 | D-023 | Experiment 2: overlap decoding with inference | **Promoted** (default `--pipeline threaded`) | 2026-11-20 |
 | D-024 | Experiment 3: PyAV decoder threading | **Rejected at screening** (no end-to-end gain) | 2026-11-21 |
 | D-025 | Experiment 4: TensorRT FP16 | **Promoted** (default `--engine auto`) | 2026-11-21 |
+| D-026 | Final configuration frozen; full 50-file run before further experiments | Accepted | 2026-11-21 |
+| D-027 | Deployment setup and clean-environment check | Accepted | 2026-11-21 |
+| D-028 | Documentation audit and corrections | Accepted | 2026-11-21 |
 
 ### D-001: Development and benchmark server
 - **Status:** Accepted · **Date:** 2026-11-20
@@ -191,6 +194,7 @@ These are requirements we can't change. They are listed so that any proposed dec
 - **Still to do:**
   - Simulate the offline timed run.
   - Test a clean `pip install -r requirements.txt` before submitting.
+- **Update 2026-11-21 (documentation audit, `validation/DOCUMENTATION_AUDIT.md`):** both items under "Still to do" have since been done: the offline run in D-025 (`validation/offline_guard.py`) and a clean install in D-027.
 
 ### D-012: How the diverse sample was picked, and the resulting subset
 - **Status:** Accepted · **Date:** 2026-11-20 · Carries out D-006.
@@ -334,6 +338,7 @@ These are requirements we can't change. They are listed so that any proposed dec
 - **Alternatives considered:**
   - Using the stock `model.predict(source=video)` path. It decodes with cv2, gives no access to exact timestamps, and is harder to make resumable.
   - Storing only per-second aggregates. That would lose the per-frame data that validation layers 2 and 3 need.
+- **Update 2026-11-21 (documentation audit, `validation/DOCUMENTATION_AUDIT.md`):** the three ⚠ interpretations were never explicitly confirmed. The implementation follows them as written: no class filter, seconds with no frames written as `[]` / 0 (`run.py` `SecondAccumulator._emit_current`), and PyAV as the decoder.
 
 ### D-015: Baseline `run.py` and scorer design
 - **Status:** Accepted · **Date:** 2026-11-20 · Carries out D-003, the first working version.
@@ -472,6 +477,7 @@ These are requirements we can't change. They are listed so that any proposed dec
   - Decoding each video twice instead of buffering frames: simpler memory use, but double decoding.
 - **Update 2026-11-20:** it passes the untouched holdout (D-018): F1 gate 0.9947, people exact 0.9950, within ±1 0.9999, identical to the simulator. It's still provisional, as the user asked, and stays the default until the user confirms it or a later change (for example the inference engine) forces a re-check.
 - **Update 2026-11-20: approved by the user as the final sampling strategy.** Any later change that alters detections (for example FP16 or TensorRT) must still re-run the D-017 and D-018 checks. The strategy itself is no longer open.
+- **Update 2026-11-21 (documentation audit, `validation/DOCUMENTATION_AUDIT.md`):** `StagedVideo.add_second` processes the buffer when **more than** 32 seconds are pending (`len(self.pending) > CHUNK_SECONDS`), so a chunk holds up to 33 seconds: 32 plus the second kept for look-ahead. The class docstring says this; "up to 32 seconds" above is off by one. The behaviour and results are unchanged.
 
 ### D-018: Untouched correctness holdout
 - **Status:** Accepted · **Date:** 2026-11-20 · Validation layer 5 (D-004).
@@ -571,6 +577,7 @@ These are requirements we can't change. They are listed so that any proposed dec
 - **⚠ "Meaningful", as I proposed it (pending the user's confirmation):** at least **5% less wall time** on the 66-video timing set, **seen in 2 runs** of each version. The run-to-run noise measured so far is 0.4% (S-3 against S-5).
 - **Update 2026-11-20: the threshold is approved by the user.** The minimum for adopting a performance optimisation is **at least 5% less end-to-end wall time, reproduced in two comparable runs** (same timing set, same GPU, nothing else running).
 - **Screening:** an experiment is first timed on the fixed 10-video profiling set (`validation/subset/profile_set.json`, every 7th sequential video, about 6 minutes per run). Only promising ones go on to the full timing set and the correctness runs.
+- **Update 2026-11-21 (documentation audit, `validation/DOCUMENTATION_AUDIT.md`):** nothing in this entry is pending any more. The ⚠ item in the status line was approved on 2026-11-20 (see the update above).
 
 ### D-021: Step 0: profile of the VPN FP32 pipeline
 - **Status:** Accepted (measurement) · **Date:** 2026-11-20 · `validation/profile_run.py`. GPU 0, the 10-video profiling set (116,255 frames decoded, 41,559 run, 1,420 predict calls, 29.3 frames per call).
@@ -641,6 +648,8 @@ These are requirements we can't change. They are listed so that any proposed dec
 - **Consequences:**
   - Peak RSS rose from 5.4 to 7.2 GB, from CUDA/cuBLAS FP16 workspaces; it's bounded and well inside 64 GB.
   - The CPU stages (decode 14%, convert 12%, pre/post-processing 9%) are now the next bottleneck, so overlapping (#2) and decoder threading (#3) gain in value.
+- **Update 2026-11-21 (documentation audit, `validation/DOCUMENTATION_AUDIT.md`):** the FP16 timing runs (S-6) were not interleaved with FP32 controls. They are compared with the FP32 runs from earlier sessions, S-3 and S-5, on the same 66 videos with GPU 0 otherwise idle. The gap (about 393 s) is about 90 times the measured run-to-run noise, so the conclusion stands, but the comparison is weaker than the interleaved ones in D-023 and D-025.
+
 ### D-023: Experiment 2: overlap decoding with inference
 - **Status:** **Promoted**: it meets every rule below. `run.py` now defaults to `--pipeline threaded`, and `--pipeline serial` is the fallback. · **Date:** 2026-11-20
 - **Acceptance rules for this experiment** (set by the user; stricter than for FP16 because this is a concurrency-only change):
@@ -720,6 +729,8 @@ These are requirements we can't change. They are listed so that any proposed dec
 - **The isolated decoder throughput** (FRAME about 19,000 fps against SLICE about 3,900, D-021) was not used as evidence, as the user asked.
 - **For the grading machine:** the decoder thread has about 4× headroom. Even if the RTX 4090 runs inference 2× faster, decoding stays hidden. If a later change makes decoding the limit, this experiment can be rerun.
 - **Code:** the option (`--decode-threading`, `--decode-threads`) was removed again to keep `run.py` small. It was about 10 lines: set `stream.codec_context.thread_count` and `stream.thread_type` before decoding.
+- **Update 2026-11-21 (documentation audit, `validation/DOCUMENTATION_AUDIT.md`):** recalculated from the logs, the largest deviation from the mean of the two controls (193.55 s) is −0.85% (FRAME, 4), not ±0.6%. It's still far from the 5% threshold, so the decision is unchanged.
+
 ### D-025: Experiment 4: TensorRT FP16
 - **Status:** **Promoted**: it meets every D-020 rule. `run.py` now defaults to `--engine auto`. · **Date:** 2026-11-21 · Control: the D-023 default (VPN, PyTorch FP16, threaded decoding).
 - **Why:** in PyTorch FP16 the forward pass is still the largest stage (about 63% in D-022, now with decoding hidden by D-023).
@@ -787,6 +798,7 @@ These are requirements we can't change. They are listed so that any proposed dec
   - The engine isn't committed (`*.engine` and `weights/` are ignored).
   - If prep wasn't run, the run still works, on PyTorch FP16.
   - The engine built here is for the RTX 6000 (Turing). The grader's RTX 4090 needs its own build, which `prep.py` does.
+- **Update 2026-11-21 (documentation audit, `validation/DOCUMENTATION_AUDIT.md`):** (1) The "4.6 GB" comes from TensorRT's log: `TensorRT-managed allocation in IExecutionContext creation: … GPU +4584, now: … GPU 4642 (MiB)`, which is about 4.5 GiB. That it is "sized for its largest profile shape" is an inference, not a measurement. (2) The size of the batched-versus-single-frame sample wasn't recorded. (3) Peak RSS values here are KiB from `/usr/bin/time` divided by 10⁶ and labelled GB: 6.2 GB is 5.95 GiB, and 7.9 GB is 7.56 GiB (see the note under the Speed log).
 
 ### D-026: Final configuration frozen; full 50-file run before further experiments
 - **Status:** Accepted (approved by the user) · **Date:** 2026-11-21
@@ -813,6 +825,7 @@ These are requirements we can't change. They are listed so that any proposed dec
   - **Cross-check:** the lines for `train-00000` and `train-00001` are byte-identical to S-10 (`seq_t1`, validated against the FP32 reference in D-025).
   - **Deliverable:** `results.jsonl.gz` (gzip -9, 1.38 MB; 43.3 MB uncompressed), sha256 `7b5be6d04739b08598074c266c33320b2e301d1cb48d120f6bc469fc910317dc`.
 - **Frozen (2026-11-21):** commit `8957966` is tagged `known-good-full-run` (requested by the user).
+- **Update 2026-11-21 (documentation audit, `validation/DOCUMENTATION_AUDIT.md`):** peak RSS 6.16 GB is 6,159,932 KiB, which is 5.87 GiB (6.31 GB). The completeness check here used the first version of `check_full_results.py`, which expected only seconds that contain a packet. That version would have flagged any video with a timestamp gap, so its pass also shows there were none. The fixed version (commit `e462731`) was re-run on files 00000–00001 only, because files 00002–00049 had been deleted.
 
 ### D-027: Deployment setup and clean-environment check
 - **Status:** Accepted: every check passes ·  **Date:** 2026-11-21
@@ -859,6 +872,25 @@ These are requirements we can't change. They are listed so that any proposed dec
   - **Fixtures:** 17 of 17 pass on the TensorRT + threaded path with the new engine.
   - **Unit tests:** 23 of 23 pass.
 ---
+- **Update 2026-11-21 (documentation audit, `validation/DOCUMENTATION_AUDIT.md`):** (1) The repository has since been made public, and an anonymous `git clone` was checked. (2) A complete `pip install` was not observed in this test; uv completed the install from the same `requirements.txt`. (3) The old-engine byte-identity check covers the 66-video sequential set only.
+
+### D-028: Documentation audit and corrections
+- **Status:** Accepted (corrections approved by the user) · **Date:** 2026-11-21
+- **Context:** the user asked for an independent check that every substantive statement in the Markdown documentation matches the code, the tests and the raw benchmark artifacts.
+- **Decision:**
+  - The audit is `validation/DOCUMENTATION_AUDIT.md`: 112 claims, of which 83 were verified, 18 partially verified, 6 inaccurate, 3 outdated and 2 unverifiable. It raised 27 findings: 0 Critical, 1 High, 5 Medium, 21 Low.
+  - Corrections are applied to APPROACH.md, README.md and HARDWARE.md.
+  - In this file, corrections are added only as dated updates to the existing entries and new rows in the index. No existing text was rewritten.
+  - No production code was changed.
+- **Main corrections:**
+  - The clean-environment test is described as it happened (a uv install, not a complete pip install).
+  - Hardware and driver compatibility, offline operation and the graders' engine differences are stated as tested conditions or predictions.
+  - Memory figures are given in correct units.
+  - The README's error-handling paragraph, chunk size, queue accounting and F1-gate label are fixed.
+- **Alternatives considered:**
+  - Leaving the wording as it was: some statements claimed more than the evidence shows.
+  - Rewriting the historical entries: against this file's rules.
+- **Next:** a real clean installation test on Ubuntu 22.04 with Python 3.11 and the exact `requirements.txt`, as requested by the user.
 
 ## Speed log
 
@@ -878,6 +910,8 @@ Every timed run, in order, so each optimisation can be compared with the one bef
 | S-9 | 2026-11-21 | D-023 + TensorRT FP16 (D-025) | profiling set (10 videos), screening | 0 (RTX 6000), alone | 10 / 116,255 / — | 103.1 s / 103.1 s; controls 193.1 / 193.7 s | — | — | — | — | 22 of 4,107 seconds differ from PyTorch FP16 (numerical) | −46.7%. Promising, so full runs followed (S-10). |
 | S-10 | 2026-11-21 | VPN + **TensorRT FP16** + threaded (D-025) | sequential subset, 2 runs interleaved with 2 D-023 controls (534.6 / 534.9 s) | 0 (RTX 6000), alone | 66 / 526,328 / 5.21 h | **310.2 s / 310.1 s (5.2 min)** | 1,696.7 | 0.0165 | ≈2.1 h | ≈0.21 h (13 min) | dev F1 0.9928, exact 0.9922, within ±1 0.9998; holdout 0.9933 / 0.9934 / 0.9999; equal to the simulator on both | −42.0% against the controls. 125,922 frames run, 4,489 predict calls, CPU 156%, peak RSS 6.23 GB. The two runs are byte-identical. Diverse 161.0 s, holdout 243.9 s. **12.4× faster than S-1.** |
 | S-11 | 2026-11-21 | Final configuration, frozen (D-026): VPN + TensorRT FP16 + threaded | **full 50 files** (`train-00000` to `train-00049`), one run | 0 (RTX 6000), alone | 1,650 / 12,981,615 / ≈128.3 h | **7,058 s (1 h 58 min)** | 1,839.2 | 0.0153 | measured: 1.96 h | ≈0.20 h (12 min) | complete (independent check); `train-00000`/`00001` byte-identical to S-10 | 2,899,828 frames run (22.3%), 104,278 predict calls, 0 errors, 0 OOM retries, peak RSS 6.16 GB. **The run that produced `results.jsonl.gz`.** |
+
+**Note 2026-11-21 (documentation audit):** the "peak RSS" values in this log are the KiB figures from `/usr/bin/time -v` divided by 10⁶ and labelled GB. In proper units they are about 2.4% higher in GB, or multiply by 0.954 for GiB. For example, S-11's 6,159,932 KiB is 6.31 GB, or 5.87 GiB. The comparisons between versions are unaffected.
 
 <!--
 Template for new entries (copy below this line):

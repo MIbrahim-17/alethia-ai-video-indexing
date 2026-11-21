@@ -54,7 +54,7 @@ We set three rules before changing anything for speed.
 |---|---|---|---|
 | Dev: sequential | 66 (files `train-00000`, `train-00001`) | 18,806 | timing and accuracy |
 | Dev: diverse | 35 from 10 files outside the graded 50, picked to cover rare resolutions, frame rates and shapes | 8,582 | accuracy |
-| Holdout | 48, a plain random sample from 8 other files | 14,341 | final confirmation only; nothing is tuned on it |
+| Holdout | 48, a plain random sample from 8 other files | 14,341 | used only to confirm or reject configurations already chosen; nothing is tuned on it |
 | Fixtures | 17 synthetic videos | — | rotation, variable frame rate, gaps, truncated and corrupt files, empty bytes, audio-only and other edge cases |
 
 The real data contains none of the damaged or unusual cases the brief warns about. That is why the synthetic fixtures exist (D-013).
@@ -85,9 +85,9 @@ The details that matter for correctness:
 **Result** (S-1, GPU 0, the 66 sequential videos):
 - **Accuracy:** identical to the reference, with every metric at 1.0000.
 - **Speed:** **3,833 s** (63.9 min), 137 frames/s, using one CPU core and about 90% of the GPU.
-- **Estimate for the full 50 files:** about 25.5 h. This is an estimate, not a measurement.
+- **Estimate for the full 50 files:** about 25.5–26 h (about 128 h of video at the baseline rate). This is an estimate, not a measurement.
 
-Decoding turned out to be cheap: about 67 CPU-seconds for all 767k dev frames, without converting them to arrays. **Inference was the cost.** That pointed at the first lever: run the model on fewer frames.
+Decoding turned out to be cheap: D-015 records about 67 CPU-seconds for all 767k dev frames, without converting them to arrays (measured during development; no stored log). **Inference was the cost.** That pointed at the first lever: run the model on fewer frames.
 
 ## 4. Step 1: frame sampling, the largest gain
 
@@ -124,7 +124,7 @@ flowchart TD
     C -- "yes, and more than one frame" --> D["Stage 2: add 3 evenly spaced frames"]
     D --> E{"V: frames disagree on an object? or P: on the person count?"}
     E -- "no" --> W
-    E -- "yes" --> F["Stage 3: run every frame of the second"]
+    E -- "yes, and frames not yet run" --> F["Stage 3: run every frame of the second"]
     F --> W
 ```
 
@@ -190,7 +190,7 @@ All times are measured, on the same 66 videos (5.21 h of video) and the same GPU
 ### 6.1 FP16 inference (D-022): promoted
 
 - **Change:** run the PyTorch model in half precision (`quantize=16`).
-- **Why it helps:** the forward pass was 76% of the time. FP16 moves half the data and uses the GPU's tensor cores. The forward pass got 1.84× faster.
+- **Why it helps:** the forward pass was 76% of the time. The measured effect is a 1.84× faster forward pass. The likely reason is that FP16 moves half the data and can use the GPU's tensor cores.
 - **Correctness:** frame by frame, the detected object set changed on 0.070% of dev frames, almost all of them detections with confidence between 0.40 and 0.45, right at the threshold.
 
   | | Dev | Holdout |
@@ -210,7 +210,7 @@ All times are measured, on the same 66 videos (5.21 h of video) and the same GPU
 ```mermaid
 flowchart LR
     P["Parquet rows"] --> D["Decoder thread<br/>PyAV decode, exact timestamps"]
-    D --> Q["Queue<br/>at most 512 MB of frames, in order"]
+    D --> Q["Queue<br/>about 512 MB of frames by YUV size, in order"]
     Q --> M["Main thread<br/>staged sampling: choose frames"]
     M --> G["GPU: YOLO11l batches<br/>of up to 32 same-size frames"]
     G --> M
@@ -240,9 +240,9 @@ flowchart LR
   | People exact | 0.9922 | 0.9934 |
   | Within ±1 | 0.9998 | 0.9999 |
 
-- **No batch dependence:** unlike PyTorch FP16, TensorRT gives the same result whether a frame runs alone or in a batch. So the simulation predicted the real run exactly, with 0 differing seconds on both sets.
+- **No batch dependence seen:** unlike PyTorch FP16, TensorRT gave the same result whether a frame ran alone or in a batch, in the sample checked for D-025. Consistent with that, the simulation predicted the real run exactly, with 0 differing seconds on both sets.
 - **Speed:** **310 s**, from 534 s (**−42%**, S-10). The two runs were byte-identical.
-- **Memory:** TensorRT reserves 4.6 GB of GPU memory up front, and peak RAM fell from 7.9 to 6.2 GB.
+- **Memory:** TensorRT allocates about 4.5 GiB of GPU memory when the engine loads (4,584 MiB in its log), and peak RAM (resident) fell from 7.6 to 5.9 GiB.
 
 ### 6.5 Deferred and not applicable (D-026)
 
@@ -278,7 +278,7 @@ All scores are measured against the every-frame FP32 reference. Each optimisatio
 
 ```mermaid
 flowchart TD
-    I["pip install -r requirements.txt<br/>exact versions, about 9 GB of wheels"] --> P["python prep.py<br/>untimed, online"]
+    I["pip install -r requirements.txt<br/>exact versions, about 8 GB of wheels"] --> P["python prep.py<br/>untimed, online"]
     P --> P1["Download yolo11l.pt and check its sha256"]
     P1 --> P2["Build weights/yolo11l.engine for this GPU"]
     P2 --> P3["Check the engine runs a batch of 32"]
@@ -292,9 +292,11 @@ flowchart TD
 - **Fallback:** if the engine is missing or doesn't load, `run.py` prints a warning and runs PyTorch FP16, which is slower but validated (section 6.1).
 - **Offline:** `run.py` sets `YOLO_OFFLINE=1` and turns off Ultralytics' auto-install. Under `validation/offline_guard.py`, which blocks Python networking, the run made 0 network attempts.
 - **Clean-environment test (D-027):**
-  - Setup: a fresh venv and a fresh copy of the repository, then `prep.py`, then offline runs on dev and the holdout.
-  - Scores with the newly built engine: dev F1 0.9918, people exact 0.9920, within ±1 0.9998; holdout 0.9935 / 0.9933 / 0.9999. All 17 fixtures and 23 unit tests passed.
-- **Engines vary between builds:** TensorRT can choose different kernels each time it builds, so two builds aren't bit-identical. The new engine changed 0.12% of seconds. With the original engine, the clean environment reproduced S-10 and `results.jsonl.gz` byte for byte, so the difference comes only from the rebuild. A run on the grading machine will differ from `results.jsonl.gz` by about this much.
+  - Setup: a fresh Python 3.11 venv and a fresh copy of the committed repository on the same server.
+  - `pip install -r requirements.txt` resolved every pinned package, but this server's route to PyPI was too slow (about 39 kB/s) for pip to finish downloading. The install was completed with `uv` from the same `requirements.txt`, using its cache and two wheels from a PyPI mirror whose sha256 hashes are identical to PyPI's.
+  - Then `pip check`, `prep.py`, and offline runs on dev and the holdout. Scores with the newly built engine: dev F1 0.9918, people exact 0.9920, within ±1 0.9998; holdout 0.9935 / 0.9933 / 0.9999. All 17 fixtures and 23 unit tests passed.
+  - Not covered by this test: a complete `pip install` on a fresh Ubuntu 22.04 machine, and the RTX 4090.
+- **Engines vary between builds:** TensorRT can choose different kernels each time it builds, so two builds aren't bit-identical. The new engine changed 0.12% of seconds. With the original engine, the clean environment reproduced S-10 and `results.jsonl.gz` byte for byte on the 66-video sequential set (files 00000–00001), so the difference comes from the rebuild. A run on the grading machine builds its own engine, so its output will differ from `results.jsonl.gz`. On the same GPU model a rebuild changed 0.12% of seconds; the size of the difference on an RTX 4090 hasn't been measured.
 
 ## 9. What we would look at next
 
