@@ -787,6 +787,31 @@ These are requirements we can't change. They are listed so that any proposed dec
   - The engine isn't committed (`*.engine` and `weights/` are ignored).
   - If prep wasn't run, the run still works, on PyTorch FP16.
   - The engine built here is for the RTX 6000 (Turing). The grader's RTX 4090 needs its own build, which `prep.py` does.
+
+### D-026: Final configuration frozen; full 50-file run before further experiments
+- **Status:** Accepted (approved by the user) · **Date:** 2026-11-21
+- **Context:** D-025 met every D-020 rule. About 45 h remained before the deadline (Sun 2026-11-22 23:55 PKT). The full run needs about 24 GB of downloads plus about 2.1 h of processing on the RTX 6000.
+- **Decision:**
+  - The selected configuration is `run.py` defaults as of commit `2ac1977`: `staged-1>3>all-VPN` sampling, FP16, threaded decoding, TensorRT FP16 engine (`--engine auto`, PyTorch FP16 fallback).
+  - Produce `results.jsonl.gz` for all 50 files with this configuration first.
+  - Experiments #5 (batch-size tuning) and #6 (less preprocessing and copying) are **deferred** until the full results are secured. #7 (cuDNN benchmark, `torch.compile`) doesn't apply to the TensorRT path.
+- **Alternatives considered:**
+  - Screen #5 and #6 first: expected gains are small (batch size gave under 1% in FP32), and any promotion would mean re-running the full validation before the full run. Risks the deadline for little benefit.
+  - Run the full set with PyTorch FP16 (D-023) for a bigger accuracy margin (F1 0.9938 against 0.9928): rejected, because TensorRT passed every rule and is what the graders will time.
+- **Consequences:**
+  - If a deferred experiment is promoted later, the full results are regenerated only if its output differs from this run.
+  - The submitted results come from the RTX 6000 engine. The graders' RTX 4090 engine may differ numerically at the 0.4 threshold, by the D-025 Layer-2 amount.
+- **Results (2026-11-21), logged as S-11:**
+  - Download of files 00002–00049 (23.8 GB) took 07:00–08:00 PKT. A server-side script checked that all 50 files were present, then ran `run.py` with the defaults on GPU 0 (08:00–09:58).
+  - **Run:** exit 0, 7,058 s (1 h 58 min) for 50 files, 1,650 videos, 12,981,615 frames (2,899,828 run through the model, 22.3%), 461,757 seconds (about 128 h of video).
+    - 0 errors, 0 file problems, 0 OOM retries, 0 overflow seconds, backend `tensorrt`.
+    - Peak RSS 6.16 GB, peak buffer 992 frames / 483 MB, queue peak 512 MB.
+  - **Completeness** (`validation/check_full_results.py`, independent of `run.py`: expected seconds from demuxed packet timestamps, no decoding):
+    - every row of all 50 files present, no extra videos;
+    - all 461,757 seconds equal the expected set; no duplicates, gaps or reordering; no error lines; schema valid;
+    - `run.py`'s decoded frame count equals the packet count for all 1,650 videos.
+  - **Cross-check:** the lines for `train-00000` and `train-00001` are byte-identical to S-10 (`seq_t1`, validated against the FP32 reference in D-025).
+  - **Deliverable:** `results.jsonl.gz` (gzip -9, 1.38 MB; 43.3 MB uncompressed), sha256 `7b5be6d04739b08598074c266c33320b2e301d1cb48d120f6bc469fc910317dc`.
 ---
 
 ## Speed log
@@ -806,6 +831,7 @@ Every timed run, in order, so each optimisation can be compared with the one bef
 | S-8 | 2026-11-21 | D-023 + decoder threading FRAME/AUTO (D-024) | profiling set (10 videos), screening only | 0 (RTX 6000), alone | 10 / 116,255 / — | 191.9–193.8 s across 5 configurations; controls 192.9 / 194.2 s | — | — | — | — | byte-identical; same inferred frames | **No gain (within ±0.6%). Rejected, not promoted.** |
 | S-9 | 2026-11-21 | D-023 + TensorRT FP16 (D-025) | profiling set (10 videos), screening | 0 (RTX 6000), alone | 10 / 116,255 / — | 103.1 s / 103.1 s; controls 193.1 / 193.7 s | — | — | — | — | 22 of 4,107 seconds differ from PyTorch FP16 (numerical) | −46.7%. Promising, so full runs followed (S-10). |
 | S-10 | 2026-11-21 | VPN + **TensorRT FP16** + threaded (D-025) | sequential subset, 2 runs interleaved with 2 D-023 controls (534.6 / 534.9 s) | 0 (RTX 6000), alone | 66 / 526,328 / 5.21 h | **310.2 s / 310.1 s (5.2 min)** | 1,696.7 | 0.0165 | ≈2.1 h | ≈0.21 h (13 min) | dev F1 0.9928, exact 0.9922, within ±1 0.9998; holdout 0.9933 / 0.9934 / 0.9999; equal to the simulator on both | −42.0% against the controls. 125,922 frames run, 4,489 predict calls, CPU 156%, peak RSS 6.23 GB. The two runs are byte-identical. Diverse 161.0 s, holdout 243.9 s. **12.4× faster than S-1.** |
+| S-11 | 2026-11-21 | Final configuration, frozen (D-026): VPN + TensorRT FP16 + threaded | **full 50 files** (`train-00000` to `train-00049`), one run | 0 (RTX 6000), alone | 1,650 / 12,981,615 / ≈128.3 h | **7,058 s (1 h 58 min)** | 1,839.2 | 0.0153 | measured: 1.96 h | ≈0.20 h (12 min) | complete (independent check); `train-00000`/`00001` byte-identical to S-10 | 2,899,828 frames run (22.3%), 104,278 predict calls, 0 errors, 0 OOM retries, peak RSS 6.16 GB. **The run that produced `results.jsonl.gz`.** |
 
 <!--
 Template for new entries (copy below this line):
