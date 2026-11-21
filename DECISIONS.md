@@ -812,6 +812,52 @@ These are requirements we can't change. They are listed so that any proposed dec
     - `run.py`'s decoded frame count equals the packet count for all 1,650 videos.
   - **Cross-check:** the lines for `train-00000` and `train-00001` are byte-identical to S-10 (`seq_t1`, validated against the FP32 reference in D-025).
   - **Deliverable:** `results.jsonl.gz` (gzip -9, 1.38 MB; 43.3 MB uncompressed), sha256 `7b5be6d04739b08598074c266c33320b2e301d1cb48d120f6bc469fc910317dc`.
+- **Frozen (2026-11-21):** commit `8957966` is tagged `known-good-full-run` (requested by the user).
+
+### D-027: Deployment setup and clean-environment check
+- **Status:** Accepted: every check passes ·  **Date:** 2026-11-21
+- **Context:** The graders start a fresh VM, run `pip install -r requirements.txt`, run the README's prep command once with internet access, then run `run.py` offline (brief §6). None of this had been tested from scratch.
+- **Decisions:**
+  - **`requirements.txt`** pins every package of the validated environment (all 70, including the dependencies of dependencies) at exact versions. The only extra index is `https://pypi.nvidia.com`, for TensorRT.
+  - **`torch` and `torchvision` are pinned as exact wheel URLs with sha256** (the cu126 builds from `download-r2.pytorch.org`), not through `--extra-index-url https://download.pytorch.org/whl/cu126`.
+    - Why: in the second clean install, pip reported "No matching distribution found for torchvision==0.29.1+cu126" even though the index lists it. A dropped connection to that index made pip treat the page as having no versions. With three indexes, every package is looked up three times, so there are more chances for this to happen.
+    - The wheels are the same, so this makes no change to the installed code.
+    - Rejected: keeping the PyTorch index and relying on retries (the same silent failure could hit the graders); `--index-url` set to the PyTorch index only (it doesn't host every other package).
+    - The NVIDIA index stays: on pypi.org, `tensorrt-cu12-libs` 10.16.1.11 is only a source stub that downloads from NVIDIA when it's built.
+  - **No apt packages:** PyAV ships FFmpeg, and OpenCV is the headless build.
+  - **The README** gives the exact steps (venv, `pip install`, `python prep.py`, run) and the fallback behaviour.
+  - **HARDWARE.md** is generated from the server's `lscpu`, `free`, `nvidia-smi` and `lsblk`, and S-11's timing.
+  - **`ai_chats/`** comes from `tools/export_chats.py`. It copies the Claude Code `.jsonl` files unedited, except that any value from `.env` is replaced with `[REMOVED]`, and it refuses to export if anything token-shaped is left. A scan found no secrets in the transcript.
+- **Clean-environment test method:**
+  - A fresh Python 3.11 venv (`python -m venv`), with pip 24.0 and `--no-cache-dir`.
+  - A fresh copy of the committed tree (`git archive HEAD`). The GitHub repo isn't publicly cloneable yet.
+  - The server had to make room first: the user approved deleting dataset files 00002–00049 (23 GB, can be downloaded again) after the full results were secured.
+  - Then: `pip check`; `prep.py` (download the weights, build a new engine); the dev and holdout runs under `offline_guard.py`; scoring against the FP32 references; comparison with S-10 and with the frozen `results.jsonl.gz` (file `train-00000`); the 17 fixtures and the unit tests, all with the clean venv.
+- **Install attempts:**
+  1. Read timeout while downloading `nvidia-cublas` from pypi.nvidia.com: a network problem.
+  2. The torchvision index-page failure described above, which led to the direct-URL change.
+  3. **pip resolved every pinned package with no conflict.** pypi.org's file host was very slow from this server, though: 39 kB/s over IPv4, with no IPv6 route, while NVIDIA's host ran at 2.2 MB/s, PyTorch's at 2.7 MB/s, and the server's total at 5.4 MB/s. With the load at 0.2, it was the network route. Triton alone (248 MB) would have taken about 100 minutes, so pip was stopped during the final downloads.
+  4. **Installed with uv, using its local cache, into a new fresh venv.** The same `requirements.txt` was used, with `--index-strategy unsafe-best-match`. The two wheels missing from the cache and slow from PyPI, `triton-3.8.0` and `numpy-2.4.6`, were fetched from the Tsinghua PyPI mirror. Their sha256 hashes were checked to be **identical to PyPI's** (`68988ac8…`, `89cd4683…`), so they're the same files.
+     - Rejected: PyTorch's own triton wheel, which is a different build with a different hash.
+     - `requirements.txt` is unchanged by this. It only works around this server's route to PyPI.
+- **Results (2026-11-21, GPU 0):**
+  - **`pip check`:** no broken requirements.
+  - **`prep.py`:** exit 0 in 8 min 9 s. The weights were downloaded from GitHub with a matching sha256, the engine was built in 351 s, and a batch of 32 ran. No warnings and no auto-install.
+  - **Offline (`offline_guard.py`):** 0 network attempts in all four runs. All used `backend=tensorrt`, with 0 errors and 0 OOM retries.
+  - **Correctness with the new engine:**
+
+    | Set | F1 gate | People exact | Within ±1 | Complete | Lowest class |
+    |---|---|---|---|---|---|
+    | dev (101) | **0.9918** | 0.9920 | 0.9998 | yes | cell phone 0.9802 |
+    | holdout (48) | **0.9935** | 0.9933 | 0.9999 | yes | cell phone 0.9824 |
+
+    Both are above the D-020 targets (0.99 / 0.98 / 0.995). The dev F1 margin is now 0.0018.
+  - **Differences from S-10:** 21 + 16 + 12 = 49 of 41,729 seconds (0.12%). Frames run: 126,017 against 125,922 on the sequential set.
+    - **Cause, proven:** the same clean environment run with **the original engine** gives output **byte-identical to S-10** and to the frozen `results.jsonl.gz` (files 00000–00001), with exactly the same frames run (125,922).
+    - So the clean install is equivalent to the validated environment. The differences come only from rebuilding the engine: TensorRT's kernel choice at build time isn't deterministic, which moves detections at the 0.4 threshold, as in D-025's Layer 2.
+    - **Consequence:** the graders build their own engine on the RTX 4090, so their output will differ from `results.jsonl.gz` by about this much. Across the two builds, dev F1 was 0.9918–0.9928.
+  - **Fixtures:** 17 of 17 pass on the TensorRT + threaded path with the new engine.
+  - **Unit tests:** 23 of 23 pass.
 ---
 
 ## Speed log

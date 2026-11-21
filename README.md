@@ -79,6 +79,8 @@ Against an every-frame FP32 reference (dev set: 101 videos, 27,388 seconds; unto
 
 The brief's thresholds are F1 ≥ 0.95, exact ≥ 0.85 and within ±1 ≥ 0.95.
 
+TensorRT doesn't build engines deterministically: each build may choose different kernels, which moves a few detections at the 0.4 confidence threshold. In a clean-environment test, a second engine built with `prep.py` changed 0.12% of seconds, and the dev F1 was 0.9918, with every metric still above the targets. Expect the same size of difference between `results.jsonl.gz` and a run on the grading machine (D-027).
+
 For speed, the full 50 files (about 128 h of video) took **1 h 58 min on one Quadro RTX 6000** (see [`HARDWARE.md`](HARDWARE.md)). The speed log at the end of `DECISIONS.md` records each step.
 
 ## Repository layout
