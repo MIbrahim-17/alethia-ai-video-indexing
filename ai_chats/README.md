@@ -19,4 +19,4 @@ These chats were held in incognito browser windows without logging in. That allo
 
 Because these chats weren't logged in, ChatGPT offers no Share link for them, and they were lost when the windows closed. So there is no `links.txt`, and the chats can't be included here.
 
-**A note on the Claude Code transcript:** on 21 Nov 2026 (14:44 UTC), Claude Code asked which other AI tools had been used, such as ChatGPT on the web, and I answered "None". That answer left out the ChatGPT use described above. This README gives the complete account.
+**A note on the Claude Code transcript:** on 21 Nov 2026 (14:44 UTC), Claude Code asked which other AI tools had been used, such as ChatGPT on the web, and I answered "None". By that I meant no other AI coding tools: Claude Code was the only one. The answer didn't mention the ChatGPT use described above, which was for prompt drafting and looking things up, not for coding. This README gives the complete account.
