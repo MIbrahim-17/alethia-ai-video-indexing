@@ -1,6 +1,6 @@
 # Hardware
 
-The full 50 files were processed on **[TO CONFIRM: university machine / own computer / rented GPU]**, a Linux workstation reached over SSH. The run used only one of its two GPUs, GPU 0.
+The full 50 files were processed on a **university machine**, a Linux workstation reached over SSH. The run used only one of its two GPUs, GPU 0.
 
 | | |
 |---|---|
