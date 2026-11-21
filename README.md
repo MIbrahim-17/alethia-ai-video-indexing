@@ -38,6 +38,24 @@ python run.py --input <folder of .parquet files> --output results.jsonl
 - When the run finishes, a `DONE ...` summary line goes to stderr, with counts, the backend used and the wall time.
 - If `weights/yolo11l.engine` is missing or fails to load, `run.py` prints a warning and carries on with PyTorch FP16. It's slower, and it was validated separately (D-022: dev F1 0.9938, people exact 0.9928, within ±1 0.9999).
 
+### Tested environment
+
+The install and run steps above were tested on the development server, which is not the grading machine (D-027, D-029):
+
+| Item | Tested |
+|---|---|
+| Machine | Quadro RTX 6000 (24 GB), Ubuntu 26.04, NVIDIA driver 595.99 |
+| Python | a fresh `python3.11 -m venv` (Python 3.11.16, pip 24.0) and a fresh copy of the committed repository |
+| Install | `pip install --no-index --find-links wheelhouse -r requirements.txt`: the exact `requirements.txt`, installed by pip from a local cache of 69 files. That is the 67 pinned packages, plus `setuptools` and `wheel`, which pip needs to build the `tensorrt-cu12` source package. The install took 3 min 33 s, and `pip check` found no problems. |
+| Cache contents | Every file's sha256 was checked against the hash published by PyPI (66 files) or NVIDIA's index (1), or pinned in `requirements.txt` (2), with `tools/verify_wheelhouse.py`. The files are identical to what `pip install -r requirements.txt` downloads. |
+| Prep | `python prep.py`: 8 min 14 s, of which the engine build was 350 s. |
+| Timed run | Offline, with Python networking blocked (`validation/offline_guard.py`): 0 network attempts. Dev F1 0.9918, people exact 0.9920, within ±1 0.9998; holdout 0.9935 / 0.9933 / 0.9999. All 17 fixtures and 23 unit tests passed. |
+| Disk | about 8 GB of downloads and 14 GB for the installed venv, plus about 200 MB in `weights/` |
+
+**Why the wheels came from a cache:** from this server, PyPI's file host and NVIDIA's index were often too slow (2–40 kB/s) for pip to finish downloading, and stalled downloads broke two attempts. In an earlier attempt pip did resolve every pinned package directly from PyPI and NVIDIA's index (D-027).
+
+**Not tested:** Ubuntu 22.04, the RTX 4090, a driver that supports only CUDA 12, and pip downloading straight from PyPI on a fast connection.
+
 ### Output
 
 There is one JSON line per second of each video, in input order:

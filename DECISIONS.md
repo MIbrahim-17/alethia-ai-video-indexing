@@ -61,6 +61,7 @@ These are requirements we can't change. They are listed so that any proposed dec
 | D-026 | Final configuration frozen; full 50-file run before further experiments | Accepted | 2026-11-21 |
 | D-027 | Deployment setup and clean-environment check | Accepted | 2026-11-21 |
 | D-028 | Documentation audit and corrections | Accepted | 2026-11-21 |
+| D-029 | Clean pip install of the exact `requirements.txt` from a verified local wheel cache | Accepted | 2026-11-21 |
 
 ### D-001: Development and benchmark server
 - **Status:** Accepted · **Date:** 2026-11-20
@@ -891,6 +892,37 @@ These are requirements we can't change. They are listed so that any proposed dec
   - Leaving the wording as it was: some statements claimed more than the evidence shows.
   - Rewriting the historical entries: against this file's rules.
 - **Next:** a real clean installation test on Ubuntu 22.04 with Python 3.11 and the exact `requirements.txt`, as requested by the user.
+- **Update 2026-11-21:** the user chose not to use Docker or an Ubuntu 22.04 container. Instead, the clean-environment test was repeated on the development server with a real, cached pip install (D-029).
+
+### D-029: Clean pip install of the exact `requirements.txt` from a verified local wheel cache
+- **Status:** Accepted: every check passes · **Date:** 2026-11-21
+- **Context:**
+  - D-027's install was completed with uv, not pip, because this server's downloads from PyPI were too slow.
+  - The user asked for a real clean-installation test: no Docker, an install from cache, the same checks as before, and the test conditions documented in the README.
+- **Method:**
+  1. **Wheel cache:** `pip download --no-deps` for each line of `requirements.txt`, retried up to 5 times per package.
+     - The PyPI mirror (`pypi.tuna.tsinghua.edu.cn`) is tried first, wheels only; NVIDIA's index is the fallback.
+     - `setuptools` and `wheel` (the newest versions) are added: the `tensorrt-cu12` source package's `[build-system]` requires `setuptools>=61.0` and `wheel`.
+     - The 4.3 GB `tensorrt-cu12-libs` wheel came from pip's temporary folder left by D-027 attempt 3, because NVIDIA's index was down to 2 kB/s.
+  2. **`tools/verify_wheelhouse.py`:** every file's sha256 is checked against the hash published by PyPI (66 files) or `pypi.nvidia.com` (1), or the `#sha256` pinned in `requirements.txt` (2: torch, torchvision). **69 of 69 match.**
+  3. **Install:** a fresh `python3.11 -m venv` (pip 24.0), then `pip install --no-cache-dir --no-index --find-links wheelhouse -r requirements.txt`.
+     - The repository copy was the committed tree (`git archive HEAD` at `691baa4`).
+     - **Exit 0 in 3 min 33 s.** pip installed all 67 pinned packages and built `tensorrt-cu12` from its source package (23 kB).
+     - The `tensorrt-cu12` source package is identical on PyPI and NVIDIA's index (sha256 `a044fe4a…`).
+  4. **The D-027 checks**, in the same order and with the same script.
+- **Results (GPU 0):**
+  - **`pip check`:** clean.
+  - **`prep.py`:** exit 0, 8 min 14 s; engine built in 349.8 s.
+  - **Offline runs:** 0 network attempts, `backend=tensorrt`, 0 errors; 310.5 / 160.7 / 244.0 s.
+  - **Scores:** dev F1 0.9918, people exact 0.9920, within ±1 0.9998; holdout 0.9935 / 0.9933 / 0.9999; complete.
+  - **Fixtures and unit tests:** 17 of 17, and 23 of 23.
+  - **All three outputs are byte-identical to the D-027 clean run's.** So this third engine build gave the same output as the second; both differ from the original S-10 engine on the same 49 seconds.
+- **Why the wheels came from a cache, and what that changes:** stalled downloads (read timeouts from NVIDIA's index) broke two attempts, and speeds fell to 2–40 kB/s. Because every cached file is sha256-identical to the published file, the installed code is the same as a direct `pip install -r requirements.txt`. What this test doesn't exercise is pip's network download from the real indexes; D-027 attempt 3 did show that pip resolves every pin there.
+- **Alternatives considered:**
+  - Docker or an Ubuntu 22.04 container: rejected by the user.
+  - Waiting for a direct download: hours at the measured speeds, and stalls broke it.
+  - A uv install, as in D-027: not pip.
+- **Not tested:** Ubuntu 22.04, the RTX 4090, a driver that supports only CUDA 12. These are documented in the README.
 
 ## Speed log
 
