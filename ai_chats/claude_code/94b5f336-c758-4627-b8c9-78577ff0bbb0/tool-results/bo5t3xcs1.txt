@@ -1,0 +1,799 @@
+== LetterBox/preprocess
+    def preprocess(self, im: torch.Tensor | list[np.ndarray]) -> torch.Tensor:
+        """Prepare input image before inference.
+
+        Args:
+            im (torch.Tensor | list[np.ndarray]): Images of shape (N, 3, H, W) for tensor, already RGB and normalized to
+                0.0-1.0, or [(H, W, 3) x N] for list of BGR uint8 arrays. See
+                ultralytics.data.loaders.LoadTensor._single_check for tensor input requirements.
+
+        Returns:
+            (torch.Tensor): Preprocessed image tensor of shape (N, 3, H, W).
+        """
+        if not isinstance(im, torch.Tensor):
+            im = self.pre_transform(im)
+            # For a single image, add a batch dimension without the copy required by np.stack().
+            im = torch.from_numpy(im[0]).unsqueeze(0) if len(im) == 1 else torch.from_numpy(np.stack(im))
+            im = im.to(self.device)  # transfer as uint8, then reorder on device
+            im = im.permute(0, 3, 1, 2).contiguous()  # BHWC to BCHW, (n, 3, h, w), dense first for a faster flip
+            if im.shape[1] == 3:
+                im = im.flip(1)  # BGR to RGB
+            im = (im.half() if self.model.fp16 else im.float()).div_(255)  # uint8 to fp16/32, 0 - 255 to 0.0 - 1.0
+        else:
+            im = im.to(self.device, torch.float16 if self.model.fp16 else torch.float32)  # already 0-1, MPS no fp64
+        return im
+
+    def inference(self, im: torch.Tensor, *args, **kwargs):
+        """Run inference on a given image using the specified model and arguments."""
+        skip = self.source_type.tensor or self.args.augment or self.args.embed  # unsupported with activation maps
+        if self.args.visualize and getattr(self.model, "base_model", True) and not skip:
+            return class_activation_map(
+                self.model,
+                im,
+                self.batch[0],
+                self.save_dir,
+                *args,
+                conf=self.args.conf,
+                classes=self.args.classes,
+                **kwargs,
+            )
+        return self.model(im, *args, augment=self.args.augment, embed=self.args.embed, **kwargs)
+
+    def pre_transform(self, im: list[np.ndarray]) -> list[np.ndarray]:
+        """Pre-transform input image before inference.
+
+        Args:
+            im (list[np.ndarray]): List of images with shape [(H, W, 3) x N].
+
+        Returns:
+            (list[np.ndarray]): List of transformed images.
+        """
+        same_shapes = len({x.shape for x in im}) == 1
+        letterbox = LetterBox(
+            self.imgsz,
+            auto=same_shapes
+            and self.args.rect
+            and not self.scale_fill
+            and (self.model.format == "pt" or (getattr(self.model, "dynamic", False) and self.model.format != "imx")),
+            scale_fill=self.scale_fill,
+            stride=self.model.stride,
+        )
+        return [letterbox(image=x) for x in im]
+
+    def postprocess(self, preds, img, orig_imgs):
+        """Post-process predictions for an image and return them."""
+        return preds
+
+    def __call__(self, source=None, model=None, stream: bool = False, *args, **kwargs):
+        """Perform inference on an image or stream.
+
+        Args:
+            source (str | Path | list[str] | list[Path] | list[np.ndarray] | np.ndarray | torch.Tensor, optional):
+                Source for inference.
+            model (str | Path | torch.nn.Module, optional): Model for inference.
+            stream (bool): Whether to stream the inference results. If True, returns a generator.
+            *args (Any): Additional arguments for the inference method.
+            **kwargs (Any): Additional keyword arguments for the inference method.
+
+        Returns:
+            (list[ultralytics.engine.results.Results] | generator): Results objects or generator of Results objects.
+        """
+        self.stream = stream
+        if stream:
+            return self.stream_inference(source, model, *args, **kwargs)
+        else:
+            return list(self.stream_inference(source, model, *args, **kwargs))  # merge list of Results into one
+
+    def predict_cli(self, source=None, model=None, cfg=None):
+        """Run prediction for the Command Line Interface (CLI).
+
+        This function is designed to run predictions using the CLI. It sets up the source and model, then processes the
+        inputs in a streaming manner. This method ensures that no outputs accumulate in memory by consuming the
+        generator without storing results.
+
+        Args:
+            source (str | Path | list[str] | list[Path] | list[np.ndarray] | np.ndarray | torch.Tensor, optional):
+                Source for inference.
+            model (str | Path | torch.nn.Module, optional): Model for inference.
+            cfg (SimpleNamespace, optional): Arguments for this run, applied under the inference lock.
+
+        Notes:
+            Do not modify this function or remove the generator. The generator ensures that no outputs are
+            accumulated in memory, which is critical for preventing memory issues during long-running predictions.
+        """
+        gen = self.stream_inference(source, model, cfg=cfg)
+        for _ in gen:  # sourcery skip: remove-empty-nested-block, noqa
+            pass
+
+    def stream_inference(self, source=None, model=None, *args, cfg=None, **kwargs):
+        """Stream inference on input source and save results to file.
+
+        Args:
+            source (str | Path | list[str] | list[Path] | list[np.ndarray] | np.ndarray | torch.Tensor, optional):
+                Source for inference.
+            model (str | Path | torch.nn.Module, optional): Model for inference.
+            *args (Any): Additional arguments for the inference method.
+            cfg (SimpleNamespace, optional): Arguments for this run, applied under the inference lock.
+            **kwargs (Any): Additional keyword arguments for the inference method.
+
+        Yields:
+            (ultralytics.engine.results.Results | torch.Tensor): Results objects, or embedding tensors when `embed` is
+                set.
+        """
+        with self._lock:  # for thread-safe inference
+            if cfg is not None:  # this call's args and save_dir, set under the lock so concurrent calls keep their own
+                keys = ("project", "name", "save_dir", "exist_ok")  # args that set save_dir
+                if any(getattr(cfg, k, None) != getattr(self.args, k, None) for k in keys):
+                    self.save_dir = get_save_dir(cfg)
+                self.args = cfg
+            if self.args.verbose:
+                LOGGER.info("")
+            if self.args.iou is None:  # Model.predict resets a reused predictor's args to the defaults
+                self.args.iou = self.default_iou
+            if self.model is None:
+                self.setup_model(model)
+            if not getattr(self.model, "base_model", True) and (
+                unsupported := [k for k in ("augment", "embed", "visualize") if getattr(self.args, k)]
+            ):
+                LOGGER.warning(f"{unsupported} not supported by this model (format='{self.model.format}'), ignoring.")
+                self.args.augment, self.args.embed, self.args.visualize = False, None, False
+
+            if self.model.format == "pt" and self.model.end2end:
+                # Class filtering needs candidates before max_det truncation.
+                self.model.model.set_head_attr(max_det=max(self.args.max_det, 300), agnostic_nms=self.args.agnostic_nms)
+            # Setup source every time predict is called
+            self.setup_source(source if source is not None else self.args.source)
+
+            # Check if save_dir/ label file exists
+            if self.args.save or self.args.save_txt:
+                (self.save_dir / "labels" if self.args.save_txt else self.save_dir).mkdir(parents=True, exist_ok=True)
+
+            self.seen, self.speed, self.pixels, self.windows, self.batch, self._bases = 0, None, None, [], None, set()
+            self._sources = {}  # output base of each video path, stream slot, or batch image
+            px = 0  # inference pixels summed per image, so a mixed-shape source averages rather than reports its last
+            profilers = (
+                ops.Profile(device=self.device),
+                ops.Profile(device=self.device),
+                ops.Profile(device=self.device),
+            )
+            dataset = self.dataset
+            batches = ((batch, dataset) for batch in dataset)
+            if (  # overlap loading with inference; each batch carries a snapshot of the loader's mode, frame and fps
+                (self.device.type == "cuda" or getattr(self.model, "prefetch", False))
+                and isinstance(dataset, LoadImagesAndVideos)
+                and (dataset.nf > dataset.ni or len(dataset) > 1)
+            ):
+                batches = _prefetch((batch, copy(dataset)) for batch in dataset)
+            try:
+                if self.args.tile and (self.source_type.tensor or self.args.embed or self.args.visualize):
+                    raise ValueError("tile requires image/video sources without embed or visualize.")
+                self.run_callbacks("on_predict_start")
+                tile_results, tile_windows = [], []
+                for batch, snapshot, tile_context in self._batches(batches):
+                    self.batch, self.dataset = batch, snapshot
+                    if not tile_results:
+                        start_times = [p.t for p in profilers]
+                        pixels = 0
+                    paths, im0s, s = self.batch
+
+                    # Preprocess
+                    with profilers[0]:
+                        im = self.preprocess(im0s)
+
+                    if not self.done_warmup:
+                        self.model.warmup(im=im)
+                        self.done_warmup = True
+
+                    # Inference
+                    with profilers[1]:
+                        preds = self.inference(im, *args, **kwargs)
+                        if self.args.embed:
+                            yield from [preds] if isinstance(preds, torch.Tensor) else preds  # yield embed tensors
+                            continue
+
+                    # Postprocess
+                    pixels += im.shape[0] * im.shape[2] * im.shape[3]
+                    with profilers[2]:
+                        self.results = self.postprocess(preds, im, im0s)
+                        if tile_context is not None:
+                            from ultralytics.engine.results import Results
+
+                            original, windows, last = tile_context
+                            tile_results.extend(self.results)
+                            tile_windows.extend(windows)
+                            if not last:
+                                continue
+                            self.batch = original
+                            paths, im0s, s = original
+                            groups = [([], []) for _ in im0s]
+                            for result, (i, window) in zip(tile_results, tile_windows):
+                                groups[i][0].append(result)
+                                groups[i][1].append(window)
+                            self.results = [
+                                Results.merge_tiles(
+                                    r, w, image, self.args.iou, self.args.agnostic_nms, self.args.max_det
+                                )
+                                for (r, w), image in zip(groups, im0s)
+                            ]
+                            tile_results.clear()
+                            tile_windows.clear()
+                        self.results = self.finalize_results(self.results)
+                    self.run_callbacks("on_predict_postprocess_end")
+
+                    # Visualize, save, write results
+                    n = len(im0s)
+                    try:
+                        for i in range(n):
+                            self.seen += 1
+                LOGGER.info(f"Results saved to {colorstr('bold', self.save_dir)}{s}")
+        self.run_callbacks("on_predict_end")  # outside the lock, so a callback can predict with this model
+
+    @smart_inference_mode(False)
+    def setup_model(self, model, verbose: bool = True):
+        """Initialize YOLO model with given parameters and set it to evaluation mode.
+
+        Args:
+            model (str | Path | torch.nn.Module): Model to load or use.
+            verbose (bool): Whether to print verbose output.
+        """
+        model = deepcopy(model)
+        self.model = AutoBackend(
+            model=model or self.args.model,
+            device=self.args.device,
+            dnn=self.args.dnn,
+            data=self.args.data,
+            fp16=self.args.quantize == 16,
+            channels_last=self.args.channels_last,
+            fuse=True,
+            verbose=verbose,
+            end2end=self.args.nms is False,
+        )
+
+        self.device = self.model.device  # update device
+        if self.device.type == "cpu" and self.model.format in {"onnx", "openvino"}:
+            torch.set_num_threads(min(2, torch.get_num_threads()))  # pre/postprocess only; idle OpenMP threads spin
+        self.model.eval()
+        self.model = attempt_compile(self.model, device=self.device, mode=self.args.compile)
+
+    def write_results(self, i: int, p: Path, im: torch.Tensor, s: list[str]) -> str:
+        """Write inference results to a file or directory.
+
+        Args:
+            i (int): Index of the current image in the batch.
+            p (Path): Path to the current image.
+            im (torch.Tensor): Preprocessed image tensor.
+            s (list[str]): List of result strings.
+
+        Returns:
+            (str): String with result information.
+== nms_boxes
+def nms_boxes(boxes: torch.Tensor, scores: torch.Tensor, iou: float, rotated: bool = False) -> torch.Tensor:
+    """Suppress boxes already offset by class, retaining the existing device-specific NMS implementation."""
+    if rotated:
+        return TorchNMS.fast_nms(boxes, scores, iou, iou_func=batch_probiou)
+    # Keep torchvision lazy and preserve XPU's native torch path.
+    if boxes.device.type != "xpu" and "torchvision" in sys.modules:
+        import torchvision
+
+        return torchvision.ops.nms(boxes, scores, iou)
+    return TorchNMS.nms(boxes, scores, iou)
+
+
+class TorchNMS:
+class TorchNMS:
+    """Ultralytics custom NMS implementation optimized for YOLO.
+    """Ultralytics custom NMS implementation optimized for YOLO.
+
+
+    This class provides static methods for performing non-maximum suppression (NMS) operations on bounding boxes,
+    This class provides static methods for performing non-maximum suppression (NMS) operations on bounding boxes,
+    including standard NMS and fast NMS.
+    including standard NMS and fast NMS.
+
+
+    Methods:
+    Methods:
+        fast_nms: Fast-NMS using upper triangular matrix operations.
+        fast_nms: Fast-NMS using upper triangular matrix operations.
+        nms: Optimized NMS with early termination that matches torchvision behavior exactly.
+        nms: Optimized NMS with early termination that matches torchvision behavior exactly.
+
+
+    Examples:
+    Examples:
+        Perform standard NMS on boxes and scores
+        Perform standard NMS on boxes and scores
+        >>> boxes = torch.tensor([[0, 0, 10, 10], [5, 5, 15, 15]])
+        >>> boxes = torch.tensor([[0, 0, 10, 10], [5, 5, 15, 15]])
+        >>> scores = torch.tensor([0.9, 0.8])
+        >>> scores = torch.tensor([0.9, 0.8])
+        >>> keep = TorchNMS.nms(boxes, scores, 0.5)
+        >>> keep = TorchNMS.nms(boxes, scores, 0.5)
+    """
+    """
+
+
+    @staticmethod
+    @staticmethod
+    def fast_nms(
+    def fast_nms(
+        boxes: torch.Tensor,
+        boxes: torch.Tensor,
+        scores: torch.Tensor,
+        scores: torch.Tensor,
+        iou_threshold: float,
+        iou_threshold: float,
+        use_triu: bool = True,
+        use_triu: bool = True,
+        iou_func=box_iou,
+        iou_func=box_iou,
+        exit_early: bool = True,
+        exit_early: bool = True,
+    ) -> torch.Tensor:
+    ) -> torch.Tensor:
+        """Fast-NMS implementation from https://arxiv.org/pdf/1904.02689 using upper triangular matrix operations.
+        """Fast-NMS implementation from https://arxiv.org/pdf/1904.02689 using upper triangular matrix operations.
+
+
+        Args:
+        Args:
+            boxes (torch.Tensor): Bounding boxes with shape (N, 4) in xyxy format, or (N, 5) in xywhr format when
+            boxes (torch.Tensor): Bounding boxes with shape (N, 4) in xyxy format, or (N, 5) in xywhr format when
+                iou_func is batch_probiou.
+                iou_func is batch_probiou.
+            scores (torch.Tensor): Confidence scores with shape (N,).
+            scores (torch.Tensor): Confidence scores with shape (N,).
+            iou_threshold (float): IoU threshold for suppression.
+            iou_threshold (float): IoU threshold for suppression.
+            use_triu (bool): Whether to use torch.triu operator for upper triangular matrix operations. If False, an
+            use_triu (bool): Whether to use torch.triu operator for upper triangular matrix operations. If False, an
+                export-friendly path zeroes suppressed scores in place and returns all N indices sorted by score.
+                export-friendly path zeroes suppressed scores in place and returns all N indices sorted by score.
+            iou_func (callable): Function to compute IoU between boxes.
+            iou_func (callable): Function to compute IoU between boxes.
+            exit_early (bool): Whether to return early if there are no boxes.
+            exit_early (bool): Whether to return early if there are no boxes.
+
+
+        Returns:
+        Returns:
+            (torch.Tensor): Indices of boxes to keep after NMS, sorted by descending score.
+            (torch.Tensor): Indices of boxes to keep after NMS, sorted by descending score.
+
+
+        Examples:
+        Examples:
+            Apply NMS to a set of boxes
+            Apply NMS to a set of boxes
+            >>> boxes = torch.tensor([[0, 0, 10, 10], [5, 5, 15, 15]])
+            >>> boxes = torch.tensor([[0, 0, 10, 10], [5, 5, 15, 15]])
+            >>> scores = torch.tensor([0.9, 0.8])
+            >>> scores = torch.tensor([0.9, 0.8])
+            >>> keep = TorchNMS.fast_nms(boxes, scores, 0.5)
+            >>> keep = TorchNMS.fast_nms(boxes, scores, 0.5)
+        """
+        """
+        if boxes.numel() == 0 and exit_early:
+        if boxes.numel() == 0 and exit_early:
+            return torch.empty((0,), dtype=torch.int64, device=boxes.device)
+            return torch.empty((0,), dtype=torch.int64, device=boxes.device)
+
+
+        sorted_idx = torch.argsort(scores, descending=True)
+        sorted_idx = torch.argsort(scores, descending=True)
+        boxes = boxes[sorted_idx]
+        boxes = boxes[sorted_idx]
+        ious = iou_func(boxes, boxes)
+        ious = iou_func(boxes, boxes)
+        if use_triu:
+        if use_triu:
+            ious = ious.triu_(diagonal=1)
+            ious = ious.triu_(diagonal=1)
+            # NOTE: no if-else on len(boxes), keeping this path exportable
+            # NOTE: no if-else on len(boxes), keeping this path exportable
+            pick = torch.nonzero((ious > iou_threshold).sum(0) <= 0).squeeze_(-1)
+            pick = torch.nonzero((ious > iou_threshold).sum(0) <= 0).squeeze_(-1)
+        else:
+        else:
+            n = boxes.shape[0]
+            n = boxes.shape[0]
+            row_idx = torch.arange(n, device=boxes.device).view(-1, 1).expand(-1, n)
+            row_idx = torch.arange(n, device=boxes.device).view(-1, 1).expand(-1, n)
+            col_idx = torch.arange(n, device=boxes.device).view(1, -1).expand(n, -1)
+            col_idx = torch.arange(n, device=boxes.device).view(1, -1).expand(n, -1)
+            upper_mask = row_idx < col_idx
+            upper_mask = row_idx < col_idx
+            ious = ious * upper_mask
+            ious = ious * upper_mask
+            # Zeroing these scores ensures the additional indices would not affect the final results
+            # Zeroing these scores ensures the additional indices would not affect the final results
+            scores_ = scores[sorted_idx]
+            scores_ = scores[sorted_idx]
+            scores_[~((ious > iou_threshold).sum(0) <= 0)] = 0
+            scores_[~((ious > iou_threshold).sum(0) <= 0)] = 0
+            scores[sorted_idx] = scores_  # update original tensor for NMSModel
+            scores[sorted_idx] = scores_  # update original tensor for NMSModel
+            # NOTE: return indices with fixed length to avoid TFLite reshape error
+            # NOTE: return indices with fixed length to avoid TFLite reshape error
+            pick = torch.topk(scores_, scores_.shape[0]).indices
+            pick = torch.topk(scores_, scores_.shape[0]).indices
+== export
+def onnx2engine(
+    onnx_file: str,
+    output_file: Path | str | None = None,
+    workspace: float | None = None,
+    quantize: int | str | None = None,
+    dynamic: bool = False,
+    shape: tuple[int, int, int, int] = (1, 3, 640, 640),
+    dla: int | None = None,
+    dataset=None,
+    metadata: dict | None = None,
+    verbose: bool = False,
+    prefix: str = "",
+) -> str:
+    """Export a YOLO model to TensorRT engine format.
+
+    Args:
+        onnx_file (str): Path to the ONNX file to be converted.
+        output_file (Path | str | None): Path to save the generated TensorRT engine file.
+        workspace (float | None): Workspace size in GiB for TensorRT, or None for TensorRT auto-allocation.
+        quantize (int | str | None): Precision scheme, 16 for FP16 or 8 for INT8.
+        dynamic (bool, optional): Enable dynamic input shapes.
+        shape (tuple[int, int, int, int], optional): Input shape (batch, channels, height, width).
+        dla (int | None): DLA core to use (Jetson devices only).
+        dataset (ultralytics.data.build.InfiniteDataLoader, optional): Dataset for INT8 calibration, unused when the
+            ONNX graph already carries Q/DQ ranges.
+        metadata (dict | None): Metadata to include in the engine file; its `stride` sizes the dynamic minimum shape.
+        verbose (bool, optional): Enable verbose logging.
+        prefix (str, optional): Prefix for log messages.
+
+    Returns:
+        (str): Path to the exported engine file.
+
+    Raises:
+        ValueError: If INT8 calibration lacks a dataset, or DLA is requested on a non-Jetson device, on TensorRT 11, or
+            without FP16/INT8 precision.
+        RuntimeError: If the ONNX file cannot be parsed or the engine build fails.
+
+    Notes:
+        TensorRT version compatibility is handled for workspace size and engine building. On TensorRT 7-10, INT8
+        calibration uses an ``IInt8Calibrator`` over ``dataset``, while FP16/INT8 are enabled with builder flags. On
+        TensorRT 11 these were removed in favor of strongly-typed networks, so reduced precision is baked into the ONNX
+        with NVIDIA ModelOpt before building (FP16 AutoCast, INT8 explicit Q/DQ) by `modelopt_quantize_onnx`. The
+        TensorRT 7-10 path keeps the head Sigmoid layers in FP32 to preserve confidence-score calibration (see #24668)
+        and the head's output layers in FP16 for accuracy. Metadata is serialized and written to the engine file if
+        provided.
+    """
+    import onnx
+
+    # Force re-install TensorRT on CUDA 13 ARM devices to >=10.15 for RT-DETR exports, <11 on JetPack (unsupported)
+    # https://github.com/ultralytics/ultralytics/issues/22873
+    if is_jetson(jetpack=7) or is_dgx():
+        check_tensorrt("10.15,<11" if IS_JETSON else "10.15")
+
+    try:
+        import tensorrt as trt
+    except ImportError:
+        check_tensorrt()
+        import tensorrt as trt
+    check_version(trt.__version__, ">=7.0.0", hard=True)
+    check_version(trt.__version__, "!=10.2.0", msg="https://github.com/ultralytics/ultralytics/pull/24367")
+
+    LOGGER.info(f"\n{prefix} starting export with TensorRT {trt.__version__}...")
+    output_file = output_file or Path(onnx_file).with_suffix(".engine")
+
+    logger = get_tensorrt_logger()
+    logger.min_severity = trt.Logger.VERBOSE if verbose else trt.Logger.INFO
+
+    # Engine builder
+    builder = trt.Builder(logger)
+    config = builder.create_builder_config()
+    workspace_bytes = int((workspace or 0) * (1 << 30))
+    trt_major = int(trt.__version__.split(".", 1)[0])
+    is_trt10 = trt_major >= 10
+    # TensorRT >= 11 is strongly-typed only: precision builder flags and IInt8Calibrator removed
+    is_trt11 = trt_major >= 11
+    if workspace_bytes > 0:
+        if hasattr(config, "set_memory_pool_limit"):
+            config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_bytes)
+        else:  # TensorRT 7 fallback
+            config.max_workspace_size = workspace_bytes
+    # EXPLICIT_BATCH flag is removed in TensorRT 10 (explicit batch is the only/default mode); keep it for TRT 7/8
+    flag = 0 if is_trt10 else (1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
+    network = builder.create_network(flag)
+    # platform_has_fast_fp16/int8 were removed from the Builder in TensorRT 10; default to True when absent
+    use_fp16 = getattr(builder, "platform_has_fast_fp16", True) and quantize == 16
+    use_int8 = getattr(builder, "platform_has_fast_int8", True) and quantize == 8
+    qdq = any(n.op_type == "QuantizeLinear" for n in onnx.load(onnx_file, load_external_data=False).graph.node)
+    calibrate = use_int8 and not qdq  # explicit quantization carries its ranges in the graph
+    if calibrate and dataset is None:
+        raise ValueError("INT8 TensorRT export requires a calibration dataset.")
+
+    # Optionally switch to DLA if enabled
+    if dla is not None:
+        if not IS_JETSON:
+            raise ValueError("DLA is only available on NVIDIA Jetson devices")
+        if is_trt11:
+            # DLA is unsupported in TensorRT 11 (through at least 11.4) and is planned to return in a later release
+            # https://docs.nvidia.com/deeplearning/tensorrt/latest/api/migration/tensorrt-10x-to-11x-jetson.html
+            raise ValueError("DLA is not supported in TensorRT 11; export with TensorRT 10.x to use DLA.")
+        LOGGER.info(f"{prefix} enabling DLA on core {dla}...")
+        if not use_fp16 and not use_int8:
+            raise ValueError(
+                "DLA requires either quantize=16 (FP16) or quantize=8 (INT8). Please enable one of them and try again."
+            )
+        config.default_device_type = trt.DeviceType.DLA
+        config.DLA_core = int(dla)
+        config.set_flag(trt.BuilderFlag.GPU_FALLBACK)
+
+    # TensorRT 11 is strongly-typed and removed the FP16/INT8 builder flags and INT8 calibrator, so reduced
+    # precision must be baked into the ONNX graph with NVIDIA ModelOpt before parsing (FP16 AutoCast, INT8 Q/DQ)
+    if is_trt11 and (use_fp16 or use_int8):
+        onnx_file = modelopt_quantize_onnx(onnx_file, 16 if qdq else quantize, dataset, shape, dynamic, prefix)
+
+    # Read ONNX file
+    parser = trt.OnnxParser(network, logger)
+    if not parser.parse_from_file(onnx_file):
+        raise RuntimeError(f"failed to load ONNX file: {onnx_file}")
+
+    # Network inputs
+    inputs = [network.get_input(i) for i in range(network.num_inputs)]
+    outputs = [network.get_output(i) for i in range(network.num_outputs)]
+    for inp in inputs:
+        LOGGER.info(f'{prefix} input "{inp.name}" with shape{inp.shape} {inp.dtype}')
+    for out in outputs:
+        LOGGER.info(f'{prefix} output "{out.name}" with shape{out.shape} {out.dtype}')
+
+    if dynamic:
+        profile = builder.create_optimization_profile()
+        old_qdq_gpu = (qdq or (is_trt11 and use_int8)) and torch.cuda.get_device_capability() <= (7, 5)  # e.g. T4
+        min_side = max(64, 2 * (metadata or {}).get("stride", 32)) if old_qdq_gpu else 32  # lacks 1x1 INT8 Q/DQ
+        min_shape = (1, shape[1], *(min(min_side, d) for d in shape[2:]))  # minimum input shape, capped at imgsz
+        max_shape = (*shape[:2], *(2 * d for d in shape[2:]))  # max input shape, 2x imgsz
+        for inp in inputs:
+            inp_min = tuple(d if d != -1 else lo for d, lo in zip(inp.shape, min_shape))
+            inp_max = tuple(d if d != -1 else hi for d, hi in zip(inp.shape, max_shape))
+            profile.set_shape(inp.name, min=inp_min, opt=shape, max=inp_max)
+        config.add_optimization_profile(profile)
+        if calibrate and not is_trt10:  # deprecated in TensorRT 10, causes internal errors
+            config.set_calibration_profile(profile)
+
+    LOGGER.info(
+        f"{prefix} building {'INT8' if use_int8 else 'FP' + ('16' if use_fp16 else '32')} engine as {output_file}"
+    )
+    if use_int8 and not is_trt11:
+        config.set_flag(trt.BuilderFlag.INT8)
+        config.profiling_verbosity = trt.ProfilingVerbosity.DETAILED
+    if (use_fp16 or use_int8 or qdq) and not is_trt11:  # unquantized layers take the fastest precision allowed
+        config.set_flag(trt.BuilderFlag.FP16)
+
+    # Explicit Q/DQ graphs need neither calibration nor per-layer Sigmoid constraints.
+    if calibrate and not is_trt11:
+
+        class EngineCalibrator(trt.IInt8Calibrator):
+            """Custom INT8 calibrator for TensorRT engine optimization.
+
+            This calibrator provides the necessary interface for TensorRT to perform INT8 quantization calibration using
+            a dataset. It handles batch generation and calibration algorithm selection.
+
+            Attributes:
+                dataset: Dataset for calibration.
+                data_iter: Iterator over the calibration dataset.
+                algo (trt.CalibrationAlgoType): Calibration algorithm type.
+                batch (int): Batch size for calibration.
+
+            Methods:
+                get_algorithm: Get the calibration algorithm to use.
+                get_batch_size: Get the batch size to use for calibration.
+                get_batch: Get the next batch to use for calibration.
+                read_calibration_cache: Return no cache so every export calibrates the current model and data.
+                write_calibration_cache: Discard the calibration cache.
+            """
+
+            def __init__(self, dataset) -> None:  # ultralytics.data.build.InfiniteDataLoader
+                """Initialize the INT8 calibrator with a dataset."""
+                trt.IInt8Calibrator.__init__(self)
+                self.dataset = dataset
+                self.data_iter = iter(dataset)
+                self.algo = (
+                    trt.CalibrationAlgoType.ENTROPY_CALIBRATION_2  # DLA quantization needs ENTROPY_CALIBRATION_2
+                    if dla is not None
+                    else trt.CalibrationAlgoType.MINMAX_CALIBRATION
+                )
+                self.batch = dataset.batch_size
+
+            def get_algorithm(self) -> trt.CalibrationAlgoType:
+                """Get the calibration algorithm to use."""
+                return self.algo
+
+            def get_batch_size(self) -> int:
+                """Get the batch size to use for calibration."""
+                return self.batch or 1
+
+            def get_batch(self, names) -> list[int] | None:
+                """Get the next batch to use for calibration, as a list of device memory pointers."""
+                try:
+                    im0s = next(self.data_iter)["img"] / 255.0
+                    im0s = im0s.to("cuda") if im0s.device.type == "cpu" else im0s
+                    return [int(im0s.data_ptr())]
+                except StopIteration:
+                    # Return None to signal to TensorRT there is no calibration data remaining
+                    return None
+
+            def read_calibration_cache(self) -> None:
+                """Return no cache so every export calibrates the current model and data."""
+
+            def write_calibration_cache(self, cache: bytes) -> None:
+                """Discard the calibration cache, which would be stale for any other model or data."""
+
+        # Load dataset w/ builder (for batching) and calibrate
+        config.int8_calibrator = EngineCalibrator(dataset)
+
+        # Implicit quantization cannot exclude op types like ModelOpt on TRT 11, so keep the head Sigmoid (an
+        # ACTIVATION layer named after its ONNX node) in FP32 via per-layer precision constraints to preserve
+        # confidence-score calibration, mirroring the OpenVINO IgnoredScope
+        # https://github.com/ultralytics/ultralytics/issues/24668, and the head's output layers and DFL in FP16 as
+        # `modelopt_quantize_onnx` does. Scope this to the head: every SiLU activation is also a Sigmoid, and
+        # constraining all of them costs INT8 speed across backbone and neck.
+        names = [network.get_layer(i).name for i in range(network.num_layers)]
+        # search, not match: nms=True exports wrap the model in NMSModel, prefixing every name with "/model"
+        indices = [int(m.group(1)) for n in names if (m := re.search(r"/model\.(\d+)/", n))]
+        head = f"/model.{max(indices)}/" if indices else "/"
+        count = 0
+        for i in range(network.num_layers):
+            layer = network.get_layer(i)
+            if head not in layer.name:
+                continue
+            if layer.type == trt.LayerType.ACTIVATION and "sigmoid" in layer.name.lower():
+                dtype = trt.float32
+            elif layer.name.endswith(("/Conv", "/ConvTranspose")) and (
+                "/conv/" not in layer.name or "/dfl/" in layer.name
+            ):
+                dtype = trt.float16
+            else:
+                continue
+            layer.precision = dtype
+            for j in range(layer.num_outputs):
+                layer.set_output_type(j, dtype)
+            count += 1
+        if count:
+            flag = (
+                trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS
+                if hasattr(trt.BuilderFlag, "OBEY_PRECISION_CONSTRAINTS")
+                else trt.BuilderFlag.STRICT_TYPES
+            )
+            config.set_flag(flag)  # OBEY_PRECISION_CONSTRAINTS replaced STRICT_TYPES in TensorRT 8.2
+            LOGGER.info(f"{prefix} keeping {count} head layers out of INT8 for accuracy")
+
+    # Write file
+    if hasattr(builder, "build_serialized_network"):
+        engine = builder.build_serialized_network(network, config)
+    else:
+        engine = builder.build_engine(network, config)
+        engine = None if engine is None else engine.serialize()
+    if engine is None:
+        raise RuntimeError("TensorRT engine build failed, check logs for errors")
+    with open(output_file, "wb") as t:
+        if metadata is not None:
+            meta = json.dumps(metadata)
+            t.write(len(meta).to_bytes(4, byteorder="little", signed=True))
+            t.write(meta.encode())
+        t.write(engine)
+    return str(output_file)
+== av
+        frame.colorspace = lib.AVCOL_SPC_SMPTE240M
+    elif colorspace == SWS_CS_BT2020:
+        frame.colorspace = lib.AVCOL_SPC_BT2020_NCL
+
+
+@cython.final
+@cython.cclass
+class VideoReformatter:
+    """An object for reformatting size and pixel format of :class:`.VideoFrame`.
+
+    It is most efficient to have a reformatter object for each set of parameters
+    you will use as calling :meth:`reformat` will reconfigure the internal object.
+
+    """
+
+    def __dealloc__(self):
+        with cython.nogil:
+            sws_free_context(cython.address(self.ptr))
+
+    def reformat(
+        self,
+        frame: VideoFrame,
+        width=None,
+        new_frame.ptr.format = dst_format
+        new_frame.ptr.width = width
+        new_frame.ptr.height = height
+
+        # A transfer-characteristic / primaries conversion is opt-in. Unlike the
+        # pre-17.0 sws_scale, sws_scale_frame inspects color_trc/color_primaries
+        # and rejects RESERVED (and other unsupported) values with EOPNOTSUPP,
+        # which regressed plain reformats of e.g. VP9 / NVDEC frames (#2208). So
+        # only feed these fields to swscale when the caller explicitly requested a
+        # destination value; otherwise neutralize them for the scale (as the old
+        # sws_scale effectively did) while still preserving the source's tags on
+        # the returned frame's metadata.
+        convert_trc: cython.bint = dst_color_trc != lib.AVCOL_TRC_UNSPECIFIED
+        convert_primaries: cython.bint = (
+            dst_color_primaries != lib.AVCOL_PRI_UNSPECIFIED
+        )
+        frame_src_color_trc: lib.AVColorTransferCharacteristic = frame.ptr.color_trc
+        frame_src_color_primaries: lib.AVColorPrimaries = frame.ptr.color_primaries
+
+        if convert_trc:
+            new_frame.ptr.color_trc = cython.cast(
+                lib.AVColorTransferCharacteristic, dst_color_trc
+            )
+        else:
+            frame.ptr.color_trc = lib.AVCOL_TRC_UNSPECIFIED
+            new_frame.ptr.color_trc = lib.AVCOL_TRC_UNSPECIFIED
+
+        if convert_primaries:
+            new_frame.ptr.color_primaries = cython.cast(
+                lib.AVColorPrimaries, dst_color_primaries
+            )
+        else:
+            frame.ptr.color_primaries = lib.AVCOL_PRI_UNSPECIFIED
+            new_frame.ptr.color_primaries = lib.AVCOL_PRI_UNSPECIFIED
+
+        # Translate source and destination colorspace/range from SWS_CS_* to AVCOL_*
+        # so sws_is_noop and sws_scale_frame understand them
+        frame_src_colorspace: lib.AVColorSpace = frame.ptr.colorspace
+        frame_src_color_range: lib.AVColorRange = frame.ptr.color_range
+        _set_frame_colorspace(frame.ptr, src_colorspace, src_color_range)
+        _set_frame_colorspace(new_frame.ptr, dst_colorspace, dst_color_range)
+
+        # Shortcut if sws_scale_frame would be a no-op
+        is_noop: cython.bint = sws_is_noop(new_frame.ptr, frame.ptr) != 0
+        if is_noop:
+            # Restore source frame metadata to avoid side effects
+            frame.ptr.colorspace = frame_src_colorspace
+            frame.ptr.color_range = frame_src_color_range
+            frame.ptr.color_trc = frame_src_color_trc
+            frame.ptr.color_primaries = frame_src_color_primaries
+            return frame
+
+        if self.ptr == cython.NULL:
+            self.ptr = sws_alloc_context()
+            if self.ptr == cython.NULL:
+                raise MemoryError("Could not allocate SwsContext")
+        self.ptr.threads = threads
+        self.ptr.flags = cython.cast(cython.uint, interpolation)
+
+        # Allocate frame buffers and perform the conversion
+        new_frame._init(dst_format, width, height)
+        with cython.nogil:
+            ret = sws_scale_frame(self.ptr, new_frame.ptr, frame.ptr)
+
+        # Restore source frame metadata to avoid side effects
+        frame.ptr.colorspace = frame_src_colorspace
+        frame.ptr.color_range = frame_src_color_range
+850:    def to_ndarray(self, channel_last=False, **kwargs):
+851-        """Get a numpy array of this frame.
+852-
+853-        Any ``**kwargs`` are passed to :meth:`.VideoReformatter.reformat`.
+854-
+855-        The array returned is generally of dimension (height, width, channels).
+856-
+857-        :param bool channel_last: If True, the shape of array will be
+858-            (height, width, channels) rather than (channels, height, width) for
+859-            the "yuv444p" and "yuvj444p" formats.
+860-
+861-        .. note:: Numpy must be installed.
+862-
+863-        .. note:: For formats which return an array of ``uint16``, ``float16`` or ``float32``,
+864-            the samples will be in the system's native byte order.
+865-
+866-        .. note:: For ``pal8``, an ``(image, palette)`` tuple will be returned,
+867-            with the palette being in ARGB (PyAV will swap bytes if needed).
+868-
+869-        .. note:: For ``gbrp`` formats, channels are flipped to RGB order.
+870-
+871-        """
+872-        if self.ptr.hw_frames_ctx and "format" not in kwargs:
+758:        if not self.reformatter:
+759:            self.reformatter = VideoReformatter()
+760:        return self.reformatter.reformat(self, *args, **kwargs)
